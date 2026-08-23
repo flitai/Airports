@@ -34,7 +34,7 @@
     python3 serve.py --no-update   跳过航图过期检查，直接起服务
 """
 import os, re, sys, json, time, threading, mimetypes, socketserver
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler
 
@@ -58,6 +58,35 @@ FLIGHT_TTL = 5.0                # 同一视口 5 秒内复用缓存，别拿免�
 FLIGHT_MAX_DIST = 250           # nm；250 nm 已经是 1400 架 / 800 KB
 _flight_lock = threading.Lock()
 _flight_cache = {}              # key -> (取回时刻, 已编码的响应体)
+
+
+FLIGHT_MAX_TILES = 4            # 视口大到一片盖不住就分片，但最多 4 片：这是别人白送的服务
+
+
+def tile_bbox(w, sth, e, n):
+    """把视口切成若干个半径 <=250 nm 的查询圆。返回 (圆心列表, 是否全覆盖)。
+
+    上游对 dist 的硬上限就是 250 nm（实测 500 直接 400），所以视野一大就只能
+    分片查。但分片数要封顶：对着免费社区服务扇出几十个请求是不礼貌的，超了
+    宁可只覆盖中心区域，并如实告诉前端 covered=False。
+    """
+    import math
+    clat = (sth + n) / 2.0
+    # 一个半径 R 的圆能内接边长 R*sqrt(2) 的正方形，按这个步长铺
+    step = FLIGHT_MAX_DIST * 1.414
+    h_nm = (n - sth) * 60.0
+    w_nm = (e - w) * 60.0 * max(0.05, math.cos(math.radians(clat)))
+    nx = max(1, math.ceil(w_nm / step))
+    ny = max(1, math.ceil(h_nm / step))
+    if nx * ny > FLIGHT_MAX_TILES:              # 盖不全就只取中心一片
+        return [((sth + n) / 2.0, (w + e) / 2.0, FLIGHT_MAX_DIST)], False
+    pts = []
+    for iy in range(ny):
+        for ix in range(nx):
+            pts.append((sth + (n - sth) * (iy + 0.5) / ny,
+                        w + (e - w) * (ix + 0.5) / nx,
+                        FLIGHT_MAX_DIST))
+    return pts, True
 
 
 def fetch_flights(lat, lon, dist):
@@ -97,25 +126,46 @@ def fetch_flights(lat, lon, dist):
 
 
 def flights_response(qs):
-    """解析查询串 → 取数（带缓存）→ 返回 (状态码, 响应体)。"""
+    """解析查询串 → 取数（带缓存）→ 返回 (状态码, 响应体)。
+
+    支持两种入参：bbox=w,s,e,n（视口，需要时自动分片）或 lat/lon/dist（单个圆）。
+    """
     try:
         q = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
-        lat, lon = float(q["lat"]), float(q["lon"])
-        dist = max(1, min(FLIGHT_MAX_DIST, int(float(q.get("dist", 100)))))
+        if "bbox" in q:
+            w, sth, e, n = [float(x) for x in q["bbox"].split(",")]
+            if not (-90 <= sth < n <= 90) or not (-180 <= w <= 180 and -180 <= e <= 180):
+                return 400, json.dumps({"error": "bad bbox"}).encode()
+            if e < w:                            # 视口跨了 180 度经线，退回中心单片
+                w, e = -180.0, 180.0
+            spots, covered = tile_bbox(w, sth, e, n)
+        else:
+            lat, lon = float(q["lat"]), float(q["lon"])
+            dist = max(1, min(FLIGHT_MAX_DIST, int(float(q.get("dist", 100)))))
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return 400, json.dumps({"error": "lat/lon out of range"}).encode()
+            spots, covered = [(lat, lon, dist)], True
     except (KeyError, ValueError):
-        return 400, json.dumps({"error": "need lat, lon, optional dist"}).encode()
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-        return 400, json.dumps({"error": "lat/lon out of range"}).encode()
+        return 400, json.dumps({"error": "need bbox=w,s,e,n or lat,lon[,dist]"}).encode()
 
     # 缓存键按 0.1° 取整：地图微动不该触发新的上游请求
-    key = (round(lat, 1), round(lon, 1), dist)
+    key = (tuple((round(a, 1), round(b, 1), c) for a, b, c in spots), covered)
     now = time.time()
     with _flight_lock:
         hit = _flight_cache.get(key)
         if hit and now - hit[0] < FLIGHT_TTL:
             return 200, hit[1]
     try:
-        body = json.dumps(fetch_flights(lat, lon, dist),
+        seen, out, src = set(), [], None
+        for la, lo, di in spots:
+            r = fetch_flights(la, lo, di)
+            src = src or r["src"]
+            for a in r["ac"]:                    # 相邻分片会重叠，按 ICAO24 去重
+                if a[0] in seen:
+                    continue
+                seen.add(a[0]); out.append(a)
+        body = json.dumps({"src": src, "t": int(time.time()), "ac": out,
+                           "covered": covered, "tiles": len(spots)},
                           separators=(",", ":")).encode()
     except Exception as e:
         return 502, json.dumps({"error": str(e)[:200]}).encode()
@@ -124,6 +174,77 @@ def flights_response(qs):
         if len(_flight_cache) > 64:             # 漫游久了别让字典无限涨
             for k in sorted(_flight_cache, key=lambda k: _flight_cache[k][0])[:32]:
                 del _flight_cache[k]
+    return 200, body
+
+
+# ---------- 航线查询 ----------
+# 注意这里查到的是「该呼号历史上飞过的航线」，不是本架次提交的飞行计划。
+# ADS-B 报文根本不含起降机场，只能靠呼号去第三方库查表，而同一呼号不同日期
+# 会飞不同城市对——实测 adsbdb 与 hexdb 对 RYR8FY 就给出两个不同答案。
+# 所以前端拿到后要用飞机当前位置做偏航校验，别把它当权威航路展示。
+ROUTE_TTL = 3600.0              # 航线近乎静态，缓存久一点；查不到的也缓存，免得通航机反复打上游
+_route_lock = threading.Lock()
+_route_cache = {}
+
+
+def _get_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "airports-map/1.0 (+https://github.com/flitai/Airports)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def lookup_route(cs):
+    """呼号 → {from,to}。adsbdb 为主（带机场名和坐标），hexdb 兜底（只给 ICAO 对）。"""
+    try:
+        d = _get_json("https://api.adsbdb.com/v0/callsign/" + cs)
+        fr = (d.get("response") or {}).get("flightroute") or {}
+        o, t = fr.get("origin"), fr.get("destination")
+        if o and t:
+            def one(a):
+                return {"icao": a.get("icao_code") or "", "iata": a.get("iata_code") or "",
+                        "name": a.get("name") or "", "lat": a.get("latitude"),
+                        "lon": a.get("longitude")}
+            return {"cs": cs, "src": "adsbdb",
+                    "airline": (fr.get("airline") or {}).get("name") or "",
+                    "from": one(o), "to": one(t)}
+    except Exception:
+        pass
+    try:                                    # hexdb 只返回 "LGIR-EBCI" 这样的字符串
+        d = _get_json("https://hexdb.io/api/v1/route/icao/" + cs)
+        parts = (d.get("route") or "").split("-")
+        if len(parts) == 2 and all(len(x) == 4 for x in parts):
+            return {"cs": cs, "src": "hexdb", "airline": "",
+                    "from": {"icao": parts[0], "iata": "", "name": "", "lat": None, "lon": None},
+                    "to":   {"icao": parts[1], "iata": "", "name": "", "lat": None, "lon": None}}
+    except Exception:
+        pass
+    return {"cs": cs, "none": True}
+
+
+def route_response(qs):
+    try:
+        q = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        cs = re.sub(r"[^A-Z0-9]", "", urllib.parse.unquote(q["cs"]).upper())[:12]
+    except (KeyError, ValueError):
+        return 400, json.dumps({"error": "need cs"}).encode()
+    if not cs:
+        return 400, json.dumps({"error": "empty callsign"}).encode()
+
+    now = time.time()
+    with _route_lock:
+        hit = _route_cache.get(cs)
+        if hit and now - hit[0] < ROUTE_TTL:
+            return 200, hit[1]
+    try:
+        body = json.dumps(lookup_route(cs), separators=(",", ":")).encode()
+    except Exception as e:
+        return 502, json.dumps({"error": str(e)[:200]}).encode()
+    with _route_lock:
+        _route_cache[cs] = (now, body)
+        if len(_route_cache) > 512:
+            for k in sorted(_route_cache, key=lambda k: _route_cache[k][0])[:256]:
+                del _route_cache[k]
     return 200, body
 
 
@@ -144,6 +265,15 @@ class RangeHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
+        if self.path.startswith("/api/route"):
+            _, _, qs = self.path.partition("?")
+            code, body = route_response(qs)
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.startswith("/api/flights"):
             _, _, qs = self.path.partition("?")
             code, body = flights_response(qs)

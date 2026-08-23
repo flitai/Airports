@@ -367,7 +367,9 @@ function bindMapEvents(){
   bindLayer("ap");
   initFlightsUI();
   map.on("click", function(e){
-    var layers = map.getLayer("closed") ? ["ap","closed"] : ["ap"];
+    var layers = ["ap"];
+    if (map.getLayer("closed"))  layers.push("closed");
+    if (map.getLayer("flights")) layers.push("flights");   // 少了这个，点飞机会被当成点空白
     if (!map.queryRenderedFeatures(e.point, {layers:layers}).length) hideDetail();
   });
 }
@@ -520,6 +522,7 @@ function icaoOf(r, d){
 
 function showDetail(id){
   var r = rowById(id); if (!r) return;
+  clearRoute();
   var d = DT[id] || {};
   curDetail = id;                    // 航图索引是异步到的，回填前要确认面板还停在同一个机场
 
@@ -608,6 +611,7 @@ function link(text, href){
 }
 function hideDetail(){
   document.getElementById("detail").classList.remove("on");
+  clearRoute();
 }
 
 // ---------- 搜索 ----------
@@ -1453,27 +1457,30 @@ function bindFlightTip(){
     map.getCanvas().style.cursor = "";
     document.getElementById("tip").style.display = "none";
   });
+  map.on("click", "flights", function(e){
+    showFlightDetail(e.features[0].properties);
+  });
 }
 
 function flightHint(t){ document.getElementById("flightHint").textContent = t || ""; }
 function flightCount(t){ document.getElementById("flightCount").textContent = t || ""; }
 
-function flightRadiusNm(){
-  // 中心到视口东北角的距离即可覆盖整个视口；上限与代理端一致
-  var b = map.getBounds(), c = map.getCenter(), R = 3440.065;
-  var p1 = c.lat*Math.PI/180, p2 = b.getNorth()*Math.PI/180;
-  var dp = p2-p1, dl = (b.getEast()-c.lng)*Math.PI/180;
-  var a = Math.sin(dp/2)*Math.sin(dp/2) +
-          Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)*Math.sin(dl/2);
-  var d = 2*R*Math.asin(Math.min(1, Math.sqrt(a)));
-  return Math.max(10, Math.min(FL_MAX_NM, Math.ceil(d)));
+function viewBbox(){
+  // 传视口而不是圆心+半径：代理端会按需切成多个 <=250 nm 的圆再合并去重。
+  // 缩得很远时 getBounds 会给出超出 ±90 / 跨越 ±180 的值，先规整掉。
+  var b = map.getBounds();
+  var s = Math.max(-85, b.getSouth()), n = Math.min(85, b.getNorth());
+  var w = b.getWest(), e = b.getEast();
+  if (e - w >= 360){ w = -180; e = 180; }
+  else { w = Math.max(-180, w); e = Math.min(180, e); }
+  if (n - s < 0.01) n = s + 0.01;
+  return [w, s, e, n].map(function(v){ return v.toFixed(3); }).join(",");
 }
 
 function pollFlights(){
   if (!flightsOn || document.hidden) return;
-  var c = map.getCenter(), seq = ++flightSeq;
-  fetch("api/flights?lat=" + c.lat.toFixed(3) + "&lon=" + c.lng.toFixed(3) +
-        "&dist=" + flightRadiusNm())
+  var seq = ++flightSeq;
+  fetch("api/flights?bbox=" + viewBbox())
     .then(function(r){ return r.json().then(function(j){ return { ok:r.ok, j:j }; }); })
     .then(function(res){
       if (seq !== flightSeq || !flightsOn) return;      // 已被更新的请求取代
@@ -1489,8 +1496,11 @@ function pollFlights(){
       if (map.getSource("flights"))
         map.getSource("flights").setData({ type:"FeatureCollection", features:f });
       flightCount(fmt(f.length) + " 架");
-      flightHint(res.j.src + " · " + new Date().toLocaleTimeString() +
-                 " · 半径 " + flightRadiusNm() + " nm");
+      // 覆盖情况要说实话：上游单次查询半径上限 250 nm，视口再大就只能盖住中心
+      var cov = res.j.covered
+        ? (res.j.tiles > 1 ? "已覆盖视口（" + res.j.tiles + " 片合并）" : "已覆盖视口")
+        : "⚠ 视口过大，只覆盖中心 " + FL_MAX_NM + " nm，放大可看全";
+      flightHint(res.j.src + " · " + new Date().toLocaleTimeString() + " · " + cov);
     })
     .catch(function(e){
       if (seq !== flightSeq) return;
@@ -1543,6 +1553,203 @@ function initFlightsUI(){
   });
 }
 
+// ---------- 航班航线 ----------
+// 查到的是「该呼号历史上飞过的航线」，不是本架次的飞行计划——ADS-B 报文里没有
+// 起降机场，只能拿呼号去第三方库查表，而同一呼号不同日期会飞不同城市对（实测
+// adsbdb 和 hexdb 对同一呼号能给出两个不同答案）。所以画出来之后要拿飞机的实际
+// 位置做偏航校验，偏得离谱就直说这条航线多半不是今天这一班。
+var ROUTE_OFF_NM = 200;                  // 偏航超过这个数就提示航线存疑
+var icaoIdx = null, routeSeq = 0;
+
+function icaoIndex(){
+  // 懒建，别让离线路径承担这个开销。键必须走 icaoOf()：ident 不等于 ICAO，
+  // 全库 784 条不一致（诺伊达的 ident 是伪码 IN-0276，真实 ICAO 是 VIND）。
+  if (icaoIdx) return icaoIdx;
+  icaoIdx = {};
+  var all = closedRows ? rows.concat(closedRows) : rows;
+  for (var i=0;i<all.length;i++){
+    var r = all[i], c = icaoOf(r, DT[r[ID]] || {});
+    if (c && !icaoIdx[c]) icaoIdx[c] = r;
+  }
+  return icaoIdx;
+}
+
+function greatCircle(a, b, n){
+  // 墨卡托上直接连两点画出来的是错的：大圆得先在球面插值再投影。
+  var toR = Math.PI/180;
+  var la1=a[1]*toR, lo1=a[0]*toR, la2=b[1]*toR, lo2=b[0]*toR;
+  var d = 2*Math.asin(Math.min(1, Math.sqrt(
+      Math.pow(Math.sin((la2-la1)/2),2) +
+      Math.cos(la1)*Math.cos(la2)*Math.pow(Math.sin((lo2-lo1)/2),2))));
+  if (!d) return [[a[0],a[1]]];
+  var pts = [], prev = null;
+  for (var i=0;i<=n;i++){
+    var f=i/n, A=Math.sin((1-f)*d)/Math.sin(d), B=Math.sin(f*d)/Math.sin(d);
+    var x=A*Math.cos(la1)*Math.cos(lo1)+B*Math.cos(la2)*Math.cos(lo2);
+    var y=A*Math.cos(la1)*Math.sin(lo1)+B*Math.cos(la2)*Math.sin(lo2);
+    var z=A*Math.sin(la1)+B*Math.sin(la2);
+    var lat=Math.atan2(z, Math.sqrt(x*x+y*y))/toR, lon=Math.atan2(y,x)/toR;
+    // 跨 180 度经线要解卷绕，否则线会横穿整张地图
+    if (prev!==null){ while (lon-prev>180) lon-=360; while (lon-prev<-180) lon+=360; }
+    prev=lon; pts.push([lon,lat]);
+  }
+  return pts;
+}
+
+function nmBetween(p1, p2){
+  var R=3440.065, toR=Math.PI/180;
+  var dp=(p2[1]-p1[1])*toR, dl=(p2[0]-p1[0])*toR;
+  var h=Math.sin(dp/2)*Math.sin(dp/2)+
+        Math.cos(p1[1]*toR)*Math.cos(p2[1]*toR)*Math.sin(dl/2)*Math.sin(dl/2);
+  return 2*R*Math.asin(Math.min(1,Math.sqrt(h)));
+}
+
+function crossTrackNm(p, a, b){
+  // 点到大圆航路的垂直距离，用来判断这架飞机是不是真的在这条航线上
+  var R=3440.065, toR=Math.PI/180;
+  function brg(p1,p2){
+    var y=Math.sin((p2[0]-p1[0])*toR)*Math.cos(p2[1]*toR);
+    var x=Math.cos(p1[1]*toR)*Math.sin(p2[1]*toR)-
+          Math.sin(p1[1]*toR)*Math.cos(p2[1]*toR)*Math.cos((p2[0]-p1[0])*toR);
+    return Math.atan2(y,x);
+  }
+  return Math.abs(Math.asin(Math.sin(nmBetween(a,p)/R)*Math.sin(brg(a,p)-brg(a,b)))*R);
+}
+
+function addRouteLayer(){
+  if (map.getSource("route")) return;
+  map.addSource("route", { type:"geojson", data:FL_EMPTY });
+  var before = map.getLayer("flights") ? "flights" : undefined;   // 航线压在飞机下面
+  map.addLayer({ id:"route-line", type:"line", source:"route",
+    filter:["==","$type","LineString"],
+    layout:{ "line-cap":"round", "line-join":"round" },
+    paint:{ "line-color":"#4ea3ff", "line-width":2.2, "line-opacity":.9,
+            "line-dasharray":[2,1.6] } }, before);
+  map.addLayer({ id:"route-pt", type:"circle", source:"route",
+    filter:["==","$type","Point"],
+    paint:{ "circle-radius":5, "circle-color":"#4ea3ff",
+            "circle-stroke-width":2, "circle-stroke-color":"rgba(8,12,18,.85)" } }, before);
+}
+
+function clearRoute(){
+  routeSeq++;                                   // 作废在途的航线请求
+  if (map && map.getSource("route")) map.getSource("route").setData(FL_EMPTY);
+}
+
+function drawRoute(from, to){
+  if (!map.getSource("route")) return;
+  map.getSource("route").setData({ type:"FeatureCollection", features:[
+    { type:"Feature", geometry:{ type:"LineString",
+        coordinates:greatCircle([from.lon,from.lat],[to.lon,to.lat],96) }, properties:{} },
+    { type:"Feature", geometry:{ type:"Point", coordinates:[from.lon,from.lat] },
+      properties:{} },
+    { type:"Feature", geometry:{ type:"Point", coordinates:[to.lon,to.lat] },
+      properties:{} }
+  ]});
+}
+
+function resolveEnd(e){
+  // 优先用本地机场库：名字与全站一致，而且能点进机场详情。
+  // 上游给的坐标只在本地查不到时兜底（例如军用场或库里没有的小场）。
+  var row = e.icao ? icaoIndex()[e.icao] : null;
+  if (row) return { icao:e.icao, row:row, lat:row[LAT], lon:row[LON],
+                    name:row[NAME], muni:row[MUNI] || "", iata:row[IATA] || e.iata || "" };
+  if (e.lat != null && e.lon != null)
+    return { icao:e.icao, row:null, lat:e.lat, lon:e.lon,
+             name:e.name || e.icao, muni:"", iata:e.iata || "" };
+  return null;
+}
+
+function showFlightDetail(p){
+  clearRoute();
+  var seq = ++routeSeq;
+  var box = document.getElementById("detail");
+  document.getElementById("dName").textContent = p.cs || p.hex || "未知航班";
+  var sub = document.getElementById("dSub");
+  sub.innerHTML = "";
+  var b = el("span","badge","航班"); b.style.background = "#4ea3ff";
+  sub.append(b, " ", [p.ty, p.reg].filter(Boolean).join(" · ") || p.hex || "");
+
+  var body = document.getElementById("dbody");
+  body.innerHTML = "";
+  var dl = el("dl");
+  function kv(k,v){ dl.append(el("dt",null,k), el("dd",null,v)); }
+  kv("气压高度", (p.alt==null||p.alt==="") ? "—" : ftm(+p.alt));
+  kv("地速",     (p.gs ==null||p.gs ==="") ? "—" : Math.round(+p.gs)+" kt");
+  kv("航向",     (p.tr ==null||p.tr ==="") ? "—" : Math.round(+p.tr)+"°");
+  kv("ICAO24",   p.hex || "—");
+  body.append(dl);
+
+  var rbox = el("div","cgrp");
+  rbox.append(el("b",null,"航线"));
+  var status = el("div","hint","查询中…");
+  rbox.append(status);
+  body.append(rbox);
+  box.classList.add("on");
+
+  if (!p.cs){ status.textContent = "该机没有广播呼号，无法查询航线。"; return; }
+
+  fetch("api/route?cs=" + encodeURIComponent(p.cs))
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (seq !== routeSeq) return;                  // 面板已经换人了
+      if (!j || j.none || j.error){
+        status.textContent = "查不到这个呼号的航线。通航、包机、军机通常都没有记录。";
+        return;
+      }
+      var A = resolveEnd(j.from), B = resolveEnd(j.to);
+      if (!A || !B){ status.textContent = "航线端点无法定位。"; return; }
+
+      rbox.innerHTML = "";
+      rbox.append(el("b",null,"航线"));
+      if (j.airline) rbox.append(el("div","hint", j.airline));
+
+      var line = el("div");
+      [[A,"起"],[B,"降"]].forEach(function(pair, i){
+        var e = pair[0], row = el("div","row");
+        row.append(el("span","badge", pair[1]), " ");
+        var label = e.icao + (e.iata ? " / " + e.iata : "") + "  " +
+                    (e.name || "") + (e.muni ? "（" + e.muni + "）" : "");
+        if (e.row){
+          var a = el("a", null, label);
+          a.href = "#"; a.style.cursor = "pointer";
+          a.addEventListener("click", function(ev){ ev.preventDefault(); showDetail(e.row[ID]); });
+          row.append(a);
+        } else row.append(el("span", null, label));
+        line.append(row);
+      });
+      rbox.append(line);
+
+      drawRoute(A, B);
+
+      // 拿实际位置校验：ADS-B 的位置是真的，查表来的航线不一定是
+      var gc = nmBetween([A.lon,A.lat],[B.lon,B.lat]);
+      var info = "大圆距离 " + fmt(Math.round(gc)) + " nm · 来源 " + (j.src||"—");
+      rbox.append(el("div","hint", info));
+      var pos = curFlightPos(p.hex);
+      if (pos){
+        var off = crossTrackNm(pos, [A.lon,A.lat], [B.lon,B.lat]);
+        if (off > ROUTE_OFF_NM)
+          rbox.append(el("div","hint",
+            "⚠ 该机当前偏离这条航线 " + fmt(Math.round(off)) + " nm。航线库按呼号查表，" +
+            "同一呼号不同日期会飞不同城市对，这条多半不是今天这一班。"));
+      }
+    })
+    .catch(function(e){
+      if (seq !== routeSeq) return;
+      status.textContent = "航线查询失败：" + String(e.message).slice(0,60);
+    });
+}
+
+function curFlightPos(hex){
+  var src = map.getSource("flights");
+  if (!src || !src._data) return null;
+  var f = src._data.features;
+  for (var i=0;i<f.length;i++)
+    if (f[i].properties.hex === hex) return f[i].geometry.coordinates;
+  return null;
+}
+
 function onStyleReady(){
   if (map.getSource("ap")) return;
   // 旧样式的图层已随 setStyle 销毁，隐藏记录一并作废；上一份样式里挂着的探测也就此作废
@@ -1551,6 +1758,7 @@ function onStyleReady(){
   addBldg3d();
   addAirportLayers();
   addFlightLayer();          // 样式重建会销毁旧图层，航班层要跟着重挂
+  addRouteLayer();
   if (!ready){ ready = true; bindMapEvents(); document.getElementById("boot").style.display = "none"; }
   setAttrib(activeMode);
   updateBldg3dUI(); probePmBldg();
@@ -1573,6 +1781,9 @@ window.__probe = function(){
            flights:{ supported:flightsSupported(), on:flightsOn, fails:flightFails,
                      layer:!!map.getLayer("flights"),
                      n:(fsrc && fsrc._data && fsrc._data.features) ? fsrc._data.features.length : 0 },
+           route:(function(){ var r=map.getSource("route");
+                    return { layer:!!map.getLayer("route-line"),
+                             n:(r && r._data && r._data.features) ? r._data.features.length : 0 }; })(),
            styleLoaded:map.isStyleLoaded(), layers:lyr.length,
            rendered:map.queryRenderedFeatures({layers:["ap"]}).length,
            labels:map.getLayer("ap-label") ? map.queryRenderedFeatures({layers:["ap-label"]}).length : -1,
@@ -1612,6 +1823,19 @@ window.__probe = function(){
 };
 window.__act = { base:function(m){ document.getElementById("fBase").value=m; setBasemap(m); },
                  flights:function(on){ setFlights(!!on); },
+                 callsigns:function(){
+                   var src=map.getSource("flights"); if(!src||!src._data) return [];
+                   return src._data.features.map(function(f){ return f.properties.cs; })
+                            .filter(Boolean); },
+                 clickFlight:function(cs){
+                   var src=map.getSource("flights"); if(!src||!src._data) return null;
+                   var f=src._data.features, pick=null;
+                   for (var i=0;i<f.length;i++){
+                     var pr=f[i].properties;
+                     if (cs ? pr.cs===cs : pr.cs){ pick=pr; break; }
+                   }
+                   if (pick) showFlightDetail(pick);
+                   return pick ? pick.cs : null; },
                  fly:function(lng,lat,z){ map.jumpTo({center:[lng,lat],zoom:z}); },
                  bldg3d:function(on){ var c=document.getElementById("fBldg3d");
                                       c.checked=!!on; toggleBldg3d(); },
