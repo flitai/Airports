@@ -161,6 +161,11 @@
         <span class="n">3D 建筑</span><span class="c" id="bldgNote"></span></label>
       <div class="hint" id="baseHint"></div>
     </div>
+    <div class="grp"><label class="t">实时航班</label>
+      <label class="row"><input type="checkbox" id="fFlights">
+        <span class="n">显示空中航班</span><span class="c" id="flightCount"></span></label>
+      <div class="hint" id="flightHint"></div>
+    </div>
   </div>
   <div id="count"></div>
 </aside>
@@ -360,6 +365,7 @@ function bindLayer(layer){
 }
 function bindMapEvents(){
   bindLayer("ap");
+  initFlightsUI();
   map.on("click", function(e){
     var layers = map.getLayer("closed") ? ["ap","closed"] : ["ap"];
     if (!map.queryRenderedFeatures(e.point, {layers:layers}).length) hideDetail();
@@ -1379,6 +1385,164 @@ function newMap(style){
 // setStyle 会清空所有 source/layer，必须在新样式加载完成后重新挂载。
 // 用 style.load（setStyle 完成时精确触发）而非 styledata（加载途中多次触发、
 // isStyleLoaded() 仍为 false，守卫会把重建整个吞掉）。
+// ---------- 实时航班（可选，默认关闭）----------
+// adsb.fi / adsb.lol 都不发 Access-Control-Allow-Origin，浏览器直连会被同源
+// 策略拦下（file:// 的 null 源和 http://localhost 都实测过），所以必须走
+// serve.py 的 /api/flights 代理。file:// 双击模式没有那个代理，入口直接禁用。
+// 这是联网增强项：不勾选就一个请求都不发，离线仍是这个项目的默认形态。
+var FL_POLL_MS = 10000;          // 轮询间隔。数据源是免费社区服务，别催它
+var FL_MAX_NM  = 250;            // 与代理端 FLIGHT_MAX_DIST 对齐
+var FL_EMPTY   = { type:"FeatureCollection", features:[] };
+var flightsOn = false, flightTimer = null, flightSeq = 0, flightFails = 0;
+
+function flightsSupported(){ return location.protocol !== "file:"; }
+
+function planeIcon(){
+  // 运行时画图标，而不是用 "✈" 这类字符：vendor/glyphs.js 只内嵌了拉丁 0-255，
+  // U+2708 不在里面，离线字形服务器根本给不出这个字。
+  var n = 24, c = document.createElement("canvas");
+  c.width = c.height = n;
+  var x = c.getContext("2d");
+  x.fillStyle = "#fff";
+  x.beginPath();
+  x.moveTo(12,1); x.lineTo(14.6,10); x.lineTo(23,15.4); x.lineTo(23,17.6);
+  x.lineTo(13.7,14.9); x.lineTo(13.2,19.6); x.lineTo(16.6,22); x.lineTo(16.6,23.4);
+  x.lineTo(12,22.2); x.lineTo(7.4,23.4); x.lineTo(7.4,22); x.lineTo(10.8,19.6);
+  x.lineTo(10.3,14.9); x.lineTo(1,17.6); x.lineTo(1,15.4); x.lineTo(9.4,10);
+  x.closePath(); x.fill();
+  return { width:n, height:n, data:new Uint8Array(x.getImageData(0,0,n,n).data) };
+}
+
+function addFlightLayer(){
+  if (!map.hasImage("plane")) map.addImage("plane", planeIcon(), { sdf:true });
+  if (map.getSource("flights")) return;
+  map.addSource("flights", { type:"geojson", data:FL_EMPTY });
+  map.addLayer({
+    id:"flights", type:"symbol", source:"flights",
+    layout:{ "visibility": flightsOn ? "visible" : "none",
+             "icon-image":"plane", "icon-rotate":["get","tr"],
+             "icon-rotation-alignment":"map", "icon-allow-overlap":true,
+             "icon-ignore-placement":true,
+             "icon-size":["interpolate",["linear"],["zoom"], 3,0.42, 7,0.62, 11,0.9] },
+    // 按气压高度着色：低空暖、高空冷，一眼能分出进近的和巡航的
+    paint:{ "icon-color":["interpolate",["linear"],["coalesce",["get","alt"],0],
+              0,"#ff8a4a", 10000,"#ffd166", 25000,"#7fd4ff", 40000,"#c3b5ff"],
+            "icon-halo-color":"rgba(8,12,18,.85)", "icon-halo-width":1.1 }
+  });
+  bindFlightTip();
+}
+
+function bindFlightTip(){
+  if (bound["flights"]) return;
+  bound["flights"] = 1;
+  var tip = document.getElementById("tip");
+  map.on("mousemove", "flights", function(e){
+    map.getCanvas().style.cursor = "pointer";
+    var p = e.features[0].properties, bits = [];
+    if (p.cs)  bits.push(p.cs);
+    if (p.ty)  bits.push(p.ty);
+    if (p.reg) bits.push(p.reg);
+    if (p.alt != null && p.alt !== "") bits.push(fmt(+p.alt) + " ft");
+    if (p.gs  != null && p.gs  !== "") bits.push(Math.round(+p.gs) + " kt");
+    tip.textContent = bits.join("  ·  ") || p.hex;
+    tip.style.display = "block";
+    tip.style.left = e.point.x + "px";
+    tip.style.top  = e.point.y + "px";
+  });
+  map.on("mouseleave", "flights", function(){
+    map.getCanvas().style.cursor = "";
+    document.getElementById("tip").style.display = "none";
+  });
+}
+
+function flightHint(t){ document.getElementById("flightHint").textContent = t || ""; }
+function flightCount(t){ document.getElementById("flightCount").textContent = t || ""; }
+
+function flightRadiusNm(){
+  // 中心到视口东北角的距离即可覆盖整个视口；上限与代理端一致
+  var b = map.getBounds(), c = map.getCenter(), R = 3440.065;
+  var p1 = c.lat*Math.PI/180, p2 = b.getNorth()*Math.PI/180;
+  var dp = p2-p1, dl = (b.getEast()-c.lng)*Math.PI/180;
+  var a = Math.sin(dp/2)*Math.sin(dp/2) +
+          Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)*Math.sin(dl/2);
+  var d = 2*R*Math.asin(Math.min(1, Math.sqrt(a)));
+  return Math.max(10, Math.min(FL_MAX_NM, Math.ceil(d)));
+}
+
+function pollFlights(){
+  if (!flightsOn || document.hidden) return;
+  var c = map.getCenter(), seq = ++flightSeq;
+  fetch("api/flights?lat=" + c.lat.toFixed(3) + "&lon=" + c.lng.toFixed(3) +
+        "&dist=" + flightRadiusNm())
+    .then(function(r){ return r.json().then(function(j){ return { ok:r.ok, j:j }; }); })
+    .then(function(res){
+      if (seq !== flightSeq || !flightsOn) return;      // 已被更新的请求取代
+      if (!res.ok) throw new Error(res.j && res.j.error ? res.j.error : "上游错误");
+      flightFails = 0;
+      var ac = res.j.ac || [], f = [];
+      for (var i=0;i<ac.length;i++){
+        var a = ac[i];
+        f.push({ type:"Feature", geometry:{ type:"Point", coordinates:[a[5], a[4]] },
+                 properties:{ hex:a[0], cs:a[1], reg:a[2], ty:a[3],
+                              alt:a[6], gs:a[7], tr:a[8] || 0 } });
+      }
+      if (map.getSource("flights"))
+        map.getSource("flights").setData({ type:"FeatureCollection", features:f });
+      flightCount(fmt(f.length) + " 架");
+      flightHint(res.j.src + " · " + new Date().toLocaleTimeString() +
+                 " · 半径 " + flightRadiusNm() + " nm");
+    })
+    .catch(function(e){
+      if (seq !== flightSeq) return;
+      flightFails++;
+      if (flightFails >= 3){                            // 别对着挂掉的上游死磕
+        setFlights(false);
+        flightHint("连续 3 次取数失败，已自动关闭。恢复网络后重新勾选即可。");
+      } else {
+        flightHint("取数失败（" + String(e.message).slice(0,60) + "），下次轮询重试");
+      }
+    });
+}
+
+function setFlights(on){
+  flightsOn = !!on && flightsSupported();
+  var cb = document.getElementById("fFlights");
+  if (cb) cb.checked = flightsOn;
+  if (map && map.getLayer("flights"))
+    map.setLayoutProperty("flights", "visibility", flightsOn ? "visible" : "none");
+  if (flightTimer){ clearInterval(flightTimer); flightTimer = null; }
+  if (flightsOn){
+    flightFails = 0;
+    flightHint("正在获取…");
+    pollFlights();
+    flightTimer = setInterval(pollFlights, FL_POLL_MS);
+  } else {
+    flightSeq++;                                        // 作废在途请求
+    if (map && map.getSource("flights")) map.getSource("flights").setData(FL_EMPTY);
+    flightCount(""); flightHint("");
+  }
+}
+
+function initFlightsUI(){
+  var cb = document.getElementById("fFlights");
+  if (!flightsSupported()){
+    cb.disabled = true;
+    flightHint("file:// 模式不可用：数据源不发 CORS 头，必须经 serve.py 代理。" +
+               "请改用 start.command / start.bat 启动。");
+    return;
+  }
+  cb.addEventListener("change", function(){ setFlights(cb.checked); });
+  document.addEventListener("visibilitychange", function(){
+    if (!document.hidden && flightsOn) pollFlights();   // 切回来立刻刷新
+  });
+  var mv = null;
+  map.on("moveend", function(){                         // 视口变了就重取，但要防抖
+    if (!flightsOn) return;
+    clearTimeout(mv);
+    mv = setTimeout(pollFlights, 700);
+  });
+}
+
 function onStyleReady(){
   if (map.getSource("ap")) return;
   // 旧样式的图层已随 setStyle 销毁，隐藏记录一并作废；上一份样式里挂着的探测也就此作废
@@ -1386,6 +1550,7 @@ function onStyleReady(){
   addHillshade();
   addBldg3d();
   addAirportLayers();
+  addFlightLayer();          // 样式重建会销毁旧图层，航班层要跟着重挂
   if (!ready){ ready = true; bindMapEvents(); document.getElementById("boot").style.display = "none"; }
   setAttrib(activeMode);
   updateBldg3dUI(); probePmBldg();
@@ -1403,7 +1568,11 @@ window.__probe = function(){
              activeMode:activeMode, pmUrl:pmUrl,
              baseHint:document.getElementById("baseHint").textContent };
   var lyr = st.layers.map(function(l){ return l.id; });
+  var fsrc = map.getSource("flights");
   return { ready:true, offline:offline, zoom:+map.getZoom().toFixed(2),
+           flights:{ supported:flightsSupported(), on:flightsOn, fails:flightFails,
+                     layer:!!map.getLayer("flights"),
+                     n:(fsrc && fsrc._data && fsrc._data.features) ? fsrc._data.features.length : 0 },
            styleLoaded:map.isStyleLoaded(), layers:lyr.length,
            rendered:map.queryRenderedFeatures({layers:["ap"]}).length,
            labels:map.getLayer("ap-label") ? map.queryRenderedFeatures({layers:["ap-label"]}).length : -1,
@@ -1442,6 +1611,7 @@ window.__probe = function(){
              return ""; })() };
 };
 window.__act = { base:function(m){ document.getElementById("fBase").value=m; setBasemap(m); },
+                 flights:function(on){ setFlights(!!on); },
                  fly:function(lng,lat,z){ map.jumpTo({center:[lng,lat],zoom:z}); },
                  bldg3d:function(on){ var c=document.getElementById("fBldg3d");
                                       c.checked=!!on; toggleBldg3d(); },

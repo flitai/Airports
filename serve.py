@@ -33,7 +33,8 @@
     python3 serve.py [端口]        默认 8000
     python3 serve.py --no-update   跳过航图过期检查，直接起服务
 """
-import os, re, sys, mimetypes, socketserver
+import os, re, sys, json, time, threading, mimetypes, socketserver
+import urllib.request, urllib.error
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler
 
@@ -43,6 +44,87 @@ RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)$")
 mimetypes.add_type("application/octet-stream", ".pmtiles")
 mimetypes.add_type("application/vnd.mapbox-vector-tile", ".mvt")
 mimetypes.add_type("application/javascript", ".js")
+
+
+# ---------- 实时航班代理 ----------
+# 为什么要代理：adsb.fi / adsb.lol 都不发 Access-Control-Allow-Origin，浏览器
+# 直连一律被同源策略拦下（file:// 的 null 源和 http://localhost 都试过）。
+# 所以只有服务器模式能用这个功能，双击 index.html 时前端会自己隐藏入口。
+FLIGHT_SOURCES = [
+    ("adsb.fi",  "https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{dist}", "aircraft"),
+    ("adsb.lol", "https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{dist}",         "ac"),
+]
+FLIGHT_TTL = 5.0                # 同一视口 5 秒内复用缓存，别拿免费社区服务当压测靶子
+FLIGHT_MAX_DIST = 250           # nm；250 nm 已经是 1400 架 / 800 KB
+_flight_lock = threading.Lock()
+_flight_cache = {}              # key -> (取回时刻, 已编码的响应体)
+
+
+def fetch_flights(lat, lon, dist):
+    """依次试各数据源，返回瘦身后的 JSON。整条链路失败就抛异常给调用方。
+
+    上游一条记录有 30+ 字段，1400 架就是 800 KB。页面只用得上 9 个字段，
+    压成定长数组后体积降一个量级——和 data/*.js 用定长数组是同一个理由。
+    """
+    last = None
+    for name, tpl, key in FLIGHT_SOURCES:
+        url = tpl.format(lat=f"{lat:.3f}", lon=f"{lon:.3f}", dist=dist)
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "airports-map/1.0 (+https://github.com/flitai/Airports)"})
+        try:
+            with urllib.request.urlopen(req, timeout=12) as r:
+                raw = json.loads(r.read())
+        except Exception as e:                  # 网络/解析/HTTP 全算失败，换下一家
+            last = f"{name}: {e}"
+            continue
+        out = []
+        for a in raw.get(key) or []:
+            la, lo = a.get("lat"), a.get("lon")
+            if la is None or lo is None:        # 只有 MLAT/TIS-B 无位置的记录
+                continue
+            alt = a.get("alt_baro")
+            out.append([
+                a.get("hex", ""),
+                (a.get("flight") or "").strip(),
+                a.get("r") or "",
+                a.get("t") or "",
+                round(la, 5), round(lo, 5),
+                None if alt in ("ground", None) else alt,
+                a.get("gs"), a.get("track"),
+            ])
+        return {"src": name, "t": int(time.time()), "ac": out}
+    raise RuntimeError(last or "no source")
+
+
+def flights_response(qs):
+    """解析查询串 → 取数（带缓存）→ 返回 (状态码, 响应体)。"""
+    try:
+        q = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        lat, lon = float(q["lat"]), float(q["lon"])
+        dist = max(1, min(FLIGHT_MAX_DIST, int(float(q.get("dist", 100)))))
+    except (KeyError, ValueError):
+        return 400, json.dumps({"error": "need lat, lon, optional dist"}).encode()
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return 400, json.dumps({"error": "lat/lon out of range"}).encode()
+
+    # 缓存键按 0.1° 取整：地图微动不该触发新的上游请求
+    key = (round(lat, 1), round(lon, 1), dist)
+    now = time.time()
+    with _flight_lock:
+        hit = _flight_cache.get(key)
+        if hit and now - hit[0] < FLIGHT_TTL:
+            return 200, hit[1]
+    try:
+        body = json.dumps(fetch_flights(lat, lon, dist),
+                          separators=(",", ":")).encode()
+    except Exception as e:
+        return 502, json.dumps({"error": str(e)[:200]}).encode()
+    with _flight_lock:
+        _flight_cache[key] = (now, body)
+        if len(_flight_cache) > 64:             # 漫游久了别让字典无限涨
+            for k in sorted(_flight_cache, key=lambda k: _flight_cache[k][0])[:32]:
+                del _flight_cache[k]
+    return 200, body
 
 
 class RangeHandler(SimpleHTTPRequestHandler):
@@ -60,6 +142,18 @@ class RangeHandler(SimpleHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
+
+    def do_GET(self):
+        if self.path.startswith("/api/flights"):
+            _, _, qs = self.path.partition("?")
+            code, body = flights_response(qs)
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
 
     def send_head(self):
         rng = self.headers.get("Range")

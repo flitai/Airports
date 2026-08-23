@@ -36,6 +36,7 @@
   其余机场给 [ChartFox](https://chartfox.org/) 外链
 - **底图** — 自动 / 在线 / 完全离线三档
 - **山体阴影** — 本地 DEM（terrarium 编码），叠在道路之下
+- **实时航班**（可选，需联网+服务器模式）— 按视口拉取空中航班，按航向旋转、按高度着色
 
 ## 底图的三种模式
 
@@ -59,6 +60,24 @@ POI/地名分层标注。各地实测标注数量（离线 vs 在线）：弗吉
 
 注意 `file://` 下浏览器禁止 `fetch`，探测不到本地瓦片，双击 `index.html` 时离线一档
 只能是 Natural Earth——要用 PMTiles 必须走启动器。
+
+## 实时航班（可选）
+
+默认**关闭**。勾选侧栏「实时航班」后，按当前视口拉取空中的航班，图标按航向旋转、
+按气压高度着色（低空暖色、高空冷色），悬停显示呼号/机型/注册号/高度/地速。
+
+数据来自 [adsb.fi](https://adsb.fi/)，失败自动回退 [adsb.lol](https://adsb.lol/)，
+两者都是社区众包的 ADS-B 聚合服务。
+
+⚠️ **只在服务器模式下可用**。这两个数据源都不发 `Access-Control-Allow-Origin`
+响应头，浏览器直连一律被同源策略拦下（`file://` 的 `null` 源和 `http://localhost`
+都实测过），所以请求必须经 `serve.py` 的 `/api/flights` 代理转发。双击
+`index.html` 时页面会自动禁用这个入口并说明原因。
+
+这是个纯粹的联网增强项，**不勾选就一个请求都不发**，离线仍是这个项目的默认形态。
+代理端对免费社区服务做了几重克制：同一视口 5 秒内复用缓存、轮询间隔 10 秒、
+标签页切到后台就停、半径上限 250 nm、连续 3 次失败自动关闭。上游一条记录有 30+
+字段，代理只透传页面用得上的 9 个并压成定长数组，实测体积降到 12%。
 
 ## 项目结构
 
@@ -143,6 +162,7 @@ FAA 只把最近三个周期留在服务器上，过期的 PDF 会 404。
 - 航图 [FAA d-TPP](https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/dtpp/)（公共领域，
   覆盖美国及其属地、密克罗尼西亚/马绍尔/帕劳）；其余机场外链 [ChartFox](https://chartfox.org/)（需 VATSIM 账号）。
   **仅供仿真使用，真实飞行请用官方现行有效版本。**
+- 实时航班 [adsb.fi](https://adsb.fi/) / [adsb.lol](https://adsb.lol/)（社区众包 ADS-B）
 - 地图引擎 [MapLibre GL JS](https://maplibre.org/) 5.6.1（BSD-3）
 - 字形 Noto Sans Regular（SIL OFL）
 
