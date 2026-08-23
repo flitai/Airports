@@ -309,7 +309,7 @@ z12 没有」这种不一致。
 
 跨机器拷贝用 `rsync -avP`（可断点续传）：
 
-    rsync -avP tiles/global-z0-13.pmtiles 用户@目标机:~/CC/Airports/tiles/
+    rsync -avP tiles/global-z0-13.pmtiles 用户@目标机:<项目目录>/tiles/
 
 ## 坑与注意事项
 

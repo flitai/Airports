@@ -393,8 +393,8 @@ if __name__ == "__main__":
     dem_files = os.path.isdir(os.path.join(OUTDIR, "dem"))
     pack = ("tar -cf dem.tar -C tiles dem        # 打包 DEM（不加 -z：png 已压缩，"
             "gzip 只省 4% 却多花 2.5 倍时间）") if dem_files else ""
-    unpack = "tar -xf dem.tar -C ~/CC/Airports/tiles/" if dem_files else \
-             "mv dem.mbtiles ~/CC/Airports/tiles/"
+    unpack = "tar -xf dem.tar -C <项目目录>/tiles/" if dem_files else \
+             "mv dem.mbtiles <项目目录>/tiles/"
     print(f"""
 下载完成。产物在 {OUTDIR}
 
@@ -402,11 +402,11 @@ if __name__ == "__main__":
     {pack}
 
 拷到目标机器（大文件建议 rsync -avP，可断点续传）：
-    rsync -avP tiles/planet.pmtiles  用户@目标机:~/CC/Airports/tiles/
+    rsync -avP tiles/planet.pmtiles  用户@目标机:<项目目录>/tiles/
     rsync -avP dem.tar               用户@目标机:~/
 
 在目标机器上就位：
-    mkdir -p ~/CC/Airports/tiles
+    mkdir -p <项目目录>/tiles
     {unpack}
-    cd ~/CC/Airports && python3 download_offline_maps.py --check
+    cd <项目目录> && python3 download_offline_maps.py --check
 """)
