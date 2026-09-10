@@ -3,6 +3,13 @@
 # ---------------------------------------------------------------
 tiles/
 
+# 瓦片的中转产物：download_offline_maps.py 打的 dem.tar、手工打的 tiles.zip 之类。
+# 目录本身已排除，但这些散落在根目录，不单独列会被 git add . 卷进去。
+tiles.zip
+dem.tar
+*.pmtiles
+*.mbtiles
+
 # ---------------------------------------------------------------
 # OurAirports 原始 CSV：23 MB，上游每日更新，公共领域可随时重下
 #   https://davidmegginson.github.io/ourairports-data/<name>.csv

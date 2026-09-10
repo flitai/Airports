@@ -10,7 +10,7 @@
 
 ## 快速开始
 
-    git clone <仓库地址> && cd Airports
+    git clone https://github.com/flitai/Airports.git && cd Airports
 
 然后二选一：
 
@@ -86,25 +86,27 @@ POI/地名分层标注。各地实测标注数量（离线 vs 在线）：弗吉
 
 ⚠️ **只在服务器模式下可用**。这两个数据源都不发 `Access-Control-Allow-Origin`
 响应头，浏览器直连一律被同源策略拦下（`file://` 的 `null` 源和 `http://localhost`
-都实测过），所以请求必须经 `serve.py` 的 `/api/flights` 代理转发。双击
-`index.html` 时页面会自动禁用这个入口并说明原因。
+都实测过），所以请求必须经 `serve.py` 转发——位置走 `/api/flights`，航线走 `/api/route`。
+双击 `index.html` 时页面会自动禁用这个入口并说明原因。
 
 这是个纯粹的联网增强项，**不勾选就一个请求都不发**，离线仍是这个项目的默认形态。
 代理端对免费社区服务做了几重克制：同一视口 5 秒内复用缓存、轮询间隔 10 秒、
-标签页切到后台就停、半径上限 250 nm、连续 3 次失败自动关闭。上游一条记录有 30+
-字段，代理只透传页面用得上的 9 个并压成定长数组，实测体积降到 12%。
+标签页切到后台就停、单片半径上限 250 nm 且最多切 4 片、连续 3 次失败自动关闭。
+航线按呼号缓存 1 小时（查不到的也缓存，免得通航机反复打上游）。上游一条记录有
+30+ 字段，代理只透传页面用得上的 9 个并压成定长数组，实测体积降到 12%。
 
 ## 项目结构
 
 ```
-index.html      单页应用（HTML+CSS+JS 全内联，72 KB）
-serve.py        支持 Range 的静态服务器，一个进程服务全部资源
-start.command   macOS 双击启动器      start.bat  Windows 双击启动器
-data/           机场数据 + FAA 航图索引（.js 格式，file:// 下也能加载）
-vendor/         maplibre-gl.js · pmtiles.js · glyphs.js（内嵌拉丁字形）
-tiles/          可选的离线瓦片，不在仓库里（见 OFFLINE.md）
-build_*.py      数据编译脚本
-fetch_*.py      按需下载矢量底图（见 TILES.md）
+index.html                单页应用（HTML+CSS+JS 全内联，90 KB）
+serve.py                  Range 静态服务器 + /api/flights、/api/route 代理，一个进程全包
+start.command             macOS 双击启动器    start.bat  Windows 双击启动器
+data/                     机场数据 + FAA 航图索引（.js 格式，file:// 下也能加载）
+vendor/                   maplibre-gl.js · pmtiles.js · glyphs.js（内嵌拉丁字形）
+tiles/                    可选的离线瓦片，不在仓库里（见 OFFLINE.md）
+build_*.py                数据编译脚本
+fetch_*.py                按需下载部分矢量底图（见 TILES.md）
+download_offline_maps.py  整份拉全球底图与高程（见 OFFLINE.md）
 ```
 
 数据输出为 `.js`（`window.X = JSON.parse('...')`）而非 `.json`，因为 `fetch`/XHR
@@ -154,6 +156,11 @@ FAA 只把最近三个周期留在服务器上，过期的 PDF 会 404。
 
 ⚠️ 双击 `index.html` 的 `file://` 模式下没有 Python 进程，**无法自动更新**，
 只能靠页面提示后手动重跑 `build_faa.py`。
+
+**副作用**：`data/faa.js` 是随仓库提交的，而自动更新会就地改写它。所以每换一个
+AIRAC 周期，`git status` 就会冒出一条 `M data/faa.js`——这不是你改的，是服务器
+自己刷的。提交它即可（让仓库里的索引保持新鲜），或者 `git checkout data/faa.js`
+丢掉、下次启动再刷。两种都行，别当成脏工作区去查。
 
 ## 已知限制
 
