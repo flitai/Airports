@@ -6,7 +6,7 @@
 
 没有构建步骤，没有 npm，没有后端。克隆下来双击 `index.html` 就能用。
 
-<img src="https://cdn.mathpix.com/snip/images/iQtQSyWNN3kF8SpEe759PgcbOxVWxsYlNpRd4x7ARnM.original.fullsize.png" />
+<img src="docs/screenshot.png" alt="离线 planet.pmtiles 底图叠 3D 建筑与山体阴影，右侧是 KEWR 的跑道与频率详情，图上是 209 架实时航班" />
 
 ## 快速开始
 
