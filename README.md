@@ -6,7 +6,7 @@
 
 没有构建步骤，没有 npm，没有后端。克隆下来双击 `index.html` 就能用。
 
-<img src="https://cdn.mathpix.com/snip/images/qiXAqzlQf1a-u_ztbAbdBchuBNbm3dweDqLLRaXMEEU.original.fullsize.png" />
+<img src="https://cdn.mathpix.com/snip/images/iQtQSyWNN3kF8SpEe759PgcbOxVWxsYlNpRd4x7ARnM.original.fullsize.png" />
 
 ## 快速开始
 
