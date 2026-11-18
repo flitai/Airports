@@ -340,6 +340,12 @@ function addClosedLayer(){
 // MapLibre 的图层级监听注册在 map 上、按图层名在派发时匹配，setStyle 不会清除它们，
 // 所以只能绑一次，否则每次切换底图都会叠加一层重复监听。
 var bound = {};
+// 给按需加载的扩展脚本（本地接收机界面 sdr/ui/sdr.js）留的接入点。主页面不知道
+// 也不关心谁挂了什么；没有扩展时这些全是空的，行为与以前完全一样。
+var hooks = { styleReady:[],        // 样式重建后要重挂的图层
+              clickLayers:[],       // 点在这些图层上不算「点了空白」
+              flightDetail:null,    // function(kv, hex)：往航班详情里追加几行
+              esc:null };           // function() -> true 表示这次 Esc 已被扩展用掉
 function bindLayer(layer){
   if (bound[layer]) return;
   bound[layer] = 1;
@@ -370,6 +376,7 @@ function bindMapEvents(){
     var layers = ["ap"];
     if (map.getLayer("closed"))  layers.push("closed");
     if (map.getLayer("flights")) layers.push("flights");   // 少了这个，点飞机会被当成点空白
+    hooks.clickLayers.forEach(function(l){ if (map.getLayer(l)) layers.push(l); });
     if (!map.queryRenderedFeatures(e.point, {layers:layers}).length) hideDetail();
   });
 }
@@ -716,6 +723,7 @@ document.getElementById("chart").addEventListener("click", function(e){
 // Esc 先关航图，再关详情面板——航图是压在详情之上的
 document.addEventListener("keydown", function(e){
   if (e.key !== "Escape") return;
+  if (hooks.esc && hooks.esc()) return;
   if (document.getElementById("chart").classList.contains("on")) closeChart();
   else hideDetail();
 });
@@ -1401,6 +1409,116 @@ var flightsOn = false, flightTimer = null, flightSeq = 0, flightFails = 0;
 
 function flightsSupported(){ return location.protocol !== "file:"; }
 
+// ---------- 飞机状态表 ----------
+// 所有来源的飞机先进这张表，再由 acRender() 统一出图。以前是「每次轮询拿整包
+// 数据直接 setData」，那样没法同时容纳两个来源：联网数据 10 秒一取，本地接收机
+// 每秒一报，同一架飞机两边都有，得有个地方按 ICAO24 把它们并起来。
+//
+// 合并规则分两类字段：
+//   位置/高度/速度/航向 —— 取「位置时刻」最新的那个来源，整组一起换，不逐项混搭
+//   呼号/注册号/机型     —— 只进不退。本地 ADS-B 报文里没有注册号和机型，
+//                           联网数据给过一次就留着，别被本地的空值冲掉
+// 每个来源每次交来的都是完整快照：这次没出现的飞机，就不再算它的。一架飞机
+// 所有来源都不要了才从表里删。
+var AC = Object.create(null);    // ICAO24 -> { hex, cs, reg, ty, by:{ 来源:{lat,lon,alt,gs,tr,t,g,x} }, trail }
+var acGen = {};                  // 来源 -> 最近一次快照的代号，用来认出「这次没出现」
+var acTimer = null, acLast = 0;
+var AC_RENDER_MS = 1000;         // 出图节流：本地数据每秒一报，再快也没有新位置可画
+var AC_TRAIL_MAX = 240;          // 每架最多留这么多个航迹点，每秒一点就是 4 分钟
+var acVis = {};                  // 来源 -> 是否要求显示；任何一个来源要显示，图层就得开着
+
+function acIngest(src, list, trail){
+  // trail=true 的来源顺带攒航迹。只有更新够密的来源才值得画：联网数据 10 秒
+  // 一个点，连起来是折线不是航迹。
+  var g = acGen[src] = (acGen[src] || 0) + 1, i, h, r;
+  for (i=0;i<list.length;i++){
+    var a = list[i];
+    if (!a.hex) continue;
+    r = AC[a.hex] || (AC[a.hex] = { hex:a.hex, cs:"", reg:"", ty:"", by:{} });
+    if (a.cs)  r.cs  = a.cs;
+    if (a.reg) r.reg = a.reg;
+    if (a.ty)  r.ty  = a.ty;
+    // x 是来源自带的附加信息（比如本地接收的信号强度），状态表不解读，原样留给详情面板
+    r.by[src] = { lat:a.lat, lon:a.lon, alt:a.alt, gs:a.gs, tr:a.tr, t:a.t || 0, g:g, x:a.x };
+    if (trail){
+      var tr = r.trail || (r.trail = { src:src, pts:[] }), last = tr.pts[tr.pts.length-1];
+      if (!last || last[0] !== a.lon || last[1] !== a.lat){
+        tr.pts.push([a.lon, a.lat]);
+        if (tr.pts.length > AC_TRAIL_MAX) tr.pts.shift();
+      }
+    }
+  }
+  for (h in AC){
+    r = AC[h];
+    if (r.by[src] && r.by[src].g !== g){
+      delete r.by[src];
+      // 航迹跟着攒它的来源走：那个来源不再报这架了，线就该断，不然会拖着一条
+      // 不再生长的尾巴，和飞机图标越离越远
+      if (r.trail && r.trail.src === src) delete r.trail;
+      var left = false;
+      for (var s in r.by){ left = true; break; }
+      if (!left) delete AC[h];
+    }
+  }
+}
+
+function acShow(src, on){
+  acVis[src] = !!on;
+  var v = acVisible() ? "visible" : "none";
+  if (map && map.getLayer("flights"))       map.setLayoutProperty("flights", "visibility", v);
+  if (map && map.getLayer("flight-trails")) map.setLayoutProperty("flight-trails", "visibility", v);
+}
+function acVisible(){ for (var s in acVis) if (acVis[s]) return true; return false; }
+
+function acTrails(){
+  var f = [];
+  for (var h in AC){
+    var tr = AC[h].trail;
+    if (tr && tr.pts.length > 1)
+      f.push({ type:"Feature", geometry:{ type:"LineString", coordinates:tr.pts }, properties:{} });
+  }
+  return { type:"FeatureCollection", features:f };
+}
+
+function acBest(r){
+  // 返回这架飞机当前该信哪个来源：位置时刻最新的那个
+  var k = null, name = "";
+  for (var s in r.by) if (!k || r.by[s].t > k.t){ k = r.by[s]; name = s; }
+  return k ? { k:k, src:name } : null;
+}
+
+function acProps(r, b){
+  return { hex:r.hex, cs:r.cs, reg:r.reg, ty:r.ty,
+           alt:b.k.alt, gs:b.k.gs, tr:b.k.tr || 0, src:b.src };
+}
+
+function acCollection(){
+  var f = [];
+  for (var h in AC){
+    var r = AC[h], b = acBest(r);
+    if (!b) continue;
+    f.push({ type:"Feature", geometry:{ type:"Point", coordinates:[b.k.lon, b.k.lat] },
+             properties:acProps(r, b) });
+  }
+  return { type:"FeatureCollection", features:f };
+}
+
+function acCount(src){
+  var n = 0;
+  for (var h in AC) if (!src || AC[h].by[src]) n++;
+  return n;
+}
+
+function acRender(now){
+  // now=true 立刻画（开关切换、清空这类用户能感知的时刻不能等节流）
+  if (acTimer){ clearTimeout(acTimer); acTimer = null; }
+  var wait = now ? 0 : AC_RENDER_MS - (Date.now() - acLast);
+  if (wait > 0){ acTimer = setTimeout(function(){ acRender(true); }, wait); return; }
+  acLast = Date.now();
+  if (map && map.getSource("flights")) map.getSource("flights").setData(acCollection());
+  if (map && map.getSource("flight-trails")) map.getSource("flight-trails").setData(acTrails());
+}
+
 function planeIcon(){
   // 运行时画图标，而不是用 "✈" 这类字符：vendor/glyphs.js 只内嵌了拉丁 0-255，
   // U+2708 不在里面，离线字形服务器根本给不出这个字。
@@ -1420,10 +1538,16 @@ function planeIcon(){
 function addFlightLayer(){
   if (!map.hasImage("plane")) map.addImage("plane", planeIcon(), { sdf:true });
   if (map.getSource("flights")) return;
-  map.addSource("flights", { type:"geojson", data:FL_EMPTY });
+  // 直接用状态表里现有的飞机建源：切换底图会销毁图层，以前要等下一次轮询
+  // （最多 10 秒）飞机才回来，现在重挂的同时就画上了
+  map.addSource("flight-trails", { type:"geojson", data:acTrails() });
+  map.addLayer({ id:"flight-trails", type:"line", source:"flight-trails",
+    layout:{ "visibility": acVisible() ? "visible" : "none", "line-cap":"round", "line-join":"round" },
+    paint:{ "line-color":"#0e9f6e", "line-width":1.6, "line-opacity":.75 } });
+  map.addSource("flights", { type:"geojson", data:acCollection() });
   map.addLayer({
     id:"flights", type:"symbol", source:"flights",
-    layout:{ "visibility": flightsOn ? "visible" : "none",
+    layout:{ "visibility": acVisible() ? "visible" : "none",
              "icon-image":"plane", "icon-rotate":["get","tr"],
              "icon-rotation-alignment":"map", "icon-allow-overlap":true,
              "icon-ignore-placement":true,
@@ -1431,7 +1555,9 @@ function addFlightLayer(){
     // 按气压高度着色：低空暖、高空冷，一眼能分出进近的和巡航的
     paint:{ "icon-color":["interpolate",["linear"],["coalesce",["get","alt"],0],
               0,"#ff8a4a", 10000,"#ffd166", 25000,"#7fd4ff", 40000,"#c3b5ff"],
-            "icon-halo-color":"rgba(8,12,18,.85)", "icon-halo-width":1.1 }
+            // 自己天线收到的飞机套一圈绿边，和联网数据一眼分得开；填色仍然表示高度
+            "icon-halo-color":["case",["==",["get","src"],"local"],"#0e9f6e","rgba(8,12,18,.85)"],
+            "icon-halo-width":["case",["==",["get","src"],"local"],2,1.1] }
   });
   bindFlightTip();
 }
@@ -1489,12 +1615,12 @@ function pollFlights(){
       var ac = res.j.ac || [], f = [];
       for (var i=0;i<ac.length;i++){
         var a = ac[i];
-        f.push({ type:"Feature", geometry:{ type:"Point", coordinates:[a[5], a[4]] },
-                 properties:{ hex:a[0], cs:a[1], reg:a[2], ty:a[3],
-                              alt:a[6], gs:a[7], tr:a[8] || 0 } });
+        // a[9] 是位置时刻；旧版代理不给这一项时退回整包的取数时刻
+        f.push({ hex:a[0], cs:a[1], reg:a[2], ty:a[3], lat:a[4], lon:a[5],
+                 alt:a[6], gs:a[7], tr:a[8] || 0, t:a[9] || res.j.t });
       }
-      if (map.getSource("flights"))
-        map.getSource("flights").setData({ type:"FeatureCollection", features:f });
+      acIngest("net", f);
+      acRender(true);                                   // 10 秒才来一包，没必要再节流
       flightCount(fmt(f.length) + " 架");
       // 覆盖情况要说实话：上游单次查询半径上限 250 nm，视口再大就只能盖住中心
       var cov = res.j.covered
@@ -1518,8 +1644,7 @@ function setFlights(on){
   flightsOn = !!on && flightsSupported();
   var cb = document.getElementById("fFlights");
   if (cb) cb.checked = flightsOn;
-  if (map && map.getLayer("flights"))
-    map.setLayoutProperty("flights", "visibility", flightsOn ? "visible" : "none");
+  acShow("net", flightsOn);
   if (flightTimer){ clearInterval(flightTimer); flightTimer = null; }
   if (flightsOn){
     flightFails = 0;
@@ -1528,7 +1653,8 @@ function setFlights(on){
     flightTimer = setInterval(pollFlights, FL_POLL_MS);
   } else {
     flightSeq++;                                        // 作废在途请求
-    if (map && map.getSource("flights")) map.getSource("flights").setData(FL_EMPTY);
+    acIngest("net", []);                                // 只撤掉联网来源，别的来源的飞机留着
+    acRender(true);
     flightCount(""); flightHint("");
   }
 }
@@ -1542,6 +1668,7 @@ function initFlightsUI(){
     return;
   }
   cb.addEventListener("change", function(){ setFlights(cb.checked); });
+  loadSdrUI();
   document.addEventListener("visibilitychange", function(){
     if (!document.hidden && flightsOn) pollFlights();   // 切回来立刻刷新
   });
@@ -1553,6 +1680,21 @@ function initFlightsUI(){
   });
 }
 
+// ---------- 本地接收机界面（按需加载）----------
+// 接收机是可选功能，绝大多数人没有那块硬件。所以它的界面代码不放进这个文件，
+// 只有 serve.py 说「接收机启用了」才去取。没启用时这里只多一个本机请求。
+function loadSdrUI(){
+  fetch("api/sdr").then(function(r){ return r.ok ? r.json() : null; }).then(function(j){
+    if (!j || !j.enabled) return;
+    var c = document.createElement("link");
+    c.rel = "stylesheet"; c.href = "sdr/ui/sdr.css";
+    document.head.appendChild(c);
+    var s = document.createElement("script");
+    s.src = "sdr/ui/sdr.js";
+    document.head.appendChild(s);
+  }).catch(function(){});            // 旧版 serve.py 没有这个接口，当作没启用
+}
+
 // ---------- 航班航线 ----------
 // 查到的是「该呼号历史上飞过的航线」，不是本架次的飞行计划——ADS-B 报文里没有
 // 起降机场，只能拿呼号去第三方库查表，而同一呼号不同日期会飞不同城市对（实测
@@ -1560,6 +1702,7 @@ function initFlightsUI(){
 // 位置做偏航校验，偏得离谱就直说这条航线多半不是今天这一班。
 var ROUTE_OFF_NM = 200;                  // 偏航超过这个数就提示航线存疑
 var icaoIdx = null, routeSeq = 0;
+var routeN = 0;                          // 航线图层里现有的要素数，只给验收探针看
 
 function icaoIndex(){
   // 懒建，别让离线路径承担这个开销。键必须走 icaoOf()：ident 不等于 ICAO，
@@ -1633,11 +1776,13 @@ function addRouteLayer(){
 
 function clearRoute(){
   routeSeq++;                                   // 作废在途的航线请求
+  routeN = 0;
   if (map && map.getSource("route")) map.getSource("route").setData(FL_EMPTY);
 }
 
 function drawRoute(from, to){
   if (!map.getSource("route")) return;
+  routeN = 3;
   map.getSource("route").setData({ type:"FeatureCollection", features:[
     { type:"Feature", geometry:{ type:"LineString",
         coordinates:greatCircle([from.lon,from.lat],[to.lon,to.lat],96) }, properties:{} },
@@ -1678,6 +1823,7 @@ function showFlightDetail(p){
   kv("地速",     (p.gs ==null||p.gs ==="") ? "—" : Math.round(+p.gs)+" kt");
   kv("航向",     (p.tr ==null||p.tr ==="") ? "—" : Math.round(+p.tr)+"°");
   kv("ICAO24",   p.hex || "—");
+  if (hooks.flightDetail) hooks.flightDetail(kv, p.hex);
   body.append(dl);
 
   var rbox = el("div","cgrp");
@@ -1742,12 +1888,8 @@ function showFlightDetail(p){
 }
 
 function curFlightPos(hex){
-  var src = map.getSource("flights");
-  if (!src || !src._data) return null;
-  var f = src._data.features;
-  for (var i=0;i<f.length;i++)
-    if (f[i].properties.hex === hex) return f[i].geometry.coordinates;
-  return null;
+  var r = AC[hex], b = r ? acBest(r) : null;
+  return b ? [b.k.lon, b.k.lat] : null;
 }
 
 function onStyleReady(){
@@ -1759,6 +1901,7 @@ function onStyleReady(){
   addAirportLayers();
   addFlightLayer();          // 样式重建会销毁旧图层，航班层要跟着重挂
   addRouteLayer();
+  hooks.styleReady.forEach(function(f){ f(); });
   if (!ready){ ready = true; bindMapEvents(); document.getElementById("boot").style.display = "none"; }
   setAttrib(activeMode);
   updateBldg3dUI(); probePmBldg();
@@ -1776,14 +1919,17 @@ window.__probe = function(){
              activeMode:activeMode, pmUrl:pmUrl,
              baseHint:document.getElementById("baseHint").textContent };
   var lyr = st.layers.map(function(l){ return l.id; });
-  var fsrc = map.getSource("flights");
   return { ready:true, offline:offline, zoom:+map.getZoom().toFixed(2),
+           // n 是地图上实际画出来的架数；net / local 是各来源各自报了多少架，
+           // 同一架两边都有时 n 只算一次
            flights:{ supported:flightsSupported(), on:flightsOn, fails:flightFails,
                      layer:!!map.getLayer("flights"),
-                     n:(fsrc && fsrc._data && fsrc._data.features) ? fsrc._data.features.length : 0 },
-           route:(function(){ var r=map.getSource("route");
-                    return { layer:!!map.getLayer("route-line"),
-                             n:(r && r._data && r._data.features) ? r._data.features.length : 0 }; })(),
+                     n:acCount(), net:acCount("net"), local:acCount("local"),
+                     trails:acTrails().features.length,
+                     // 状态表里有不等于画出来了：shown 是当前视口内真正渲染出的图标数
+                     shown:map.getLayer("flights") ? map.queryRenderedFeatures({layers:["flights"]}).length : -1 },
+           route:{ layer:!!map.getLayer("route-line"), n:routeN },
+           sdr:window.__sdr ? window.__sdr.probe() : null,
            styleLoaded:map.isStyleLoaded(), layers:lyr.length,
            rendered:map.queryRenderedFeatures({layers:["ap"]}).length,
            labels:map.getLayer("ap-label") ? map.queryRenderedFeatures({layers:["ap-label"]}).length : -1,
@@ -1824,18 +1970,20 @@ window.__probe = function(){
 window.__act = { base:function(m){ document.getElementById("fBase").value=m; setBasemap(m); },
                  flights:function(on){ setFlights(!!on); },
                  callsigns:function(){
-                   var src=map.getSource("flights"); if(!src||!src._data) return [];
-                   return src._data.features.map(function(f){ return f.properties.cs; })
-                            .filter(Boolean); },
+                   var out=[]; for (var h in AC) if (AC[h].cs) out.push(AC[h].cs);
+                   return out; },
                  clickFlight:function(cs){
-                   var src=map.getSource("flights"); if(!src||!src._data) return null;
-                   var f=src._data.features, pick=null;
-                   for (var i=0;i<f.length;i++){
-                     var pr=f[i].properties;
-                     if (cs ? pr.cs===cs : pr.cs){ pick=pr; break; }
+                   var pick=null;
+                   for (var h in AC){
+                     var r=AC[h], b=acBest(r);
+                     if (b && (cs ? r.cs===cs : r.cs)){ pick=acProps(r, b); break; }
                    }
                    if (pick) showFlightDetail(pick);
                    return pick ? pick.cs : null; },
+                 // 往状态表里灌一个来源的快照，验收多来源合并时用，不经过网络
+                 ingest:function(src, list, trail){ acIngest(src, list, trail); acRender(true); },
+                 sdr:function(name, arg){ return window.__sdr ? window.__sdr.act(name, arg) : null; },
+                 flightPos:function(hex){ return curFlightPos(hex); },
                  fly:function(lng,lat,z){ map.jumpTo({center:[lng,lat],zoom:z}); },
                  bldg3d:function(on){ var c=document.getElementById("fBldg3d");
                                       c.checked=!!on; toggleBldg3d(); },
@@ -1845,6 +1993,13 @@ window.__act = { base:function(m){ document.getElementById("fBase").value=m; set
                                     if (a[i||0]) a[i||0].click(); },
                  chartClose:function(){ closeChart(); },
                  rowOf:function(ident){ for(var i=0;i<rows.length;i++) if(rows[i][IDENT]===ident) return rows[i]; } };
+
+// 页面主体是一个闭合的函数，外面的脚本够不着里面的任何东西。这里把扩展脚本
+// 需要的那一小部分明确交出去：地图、几个工具函数、飞机状态表的入口、钩子。
+window.__app = { map:function(){ return map; }, el:el, fmt:fmt,
+                 nmBetween:nmBetween, hooks:hooks,
+                 ac:{ ingest:acIngest, render:acRender, show:acShow, count:acCount,
+                      get:function(hex){ return AC[hex] || null; } } };
 
 function boot(){
   // pmtiles 协议：让 MapLibre 能从单个大文件按 Range 读瓦片

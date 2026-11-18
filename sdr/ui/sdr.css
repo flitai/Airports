@@ -1,0 +1,35 @@
+/* 本地接收机界面。只在 serve.py 报告接收机已启用时才加载，沿用主页面的 CSS 变量。 */
+
+/* ---------- 状态条 ----------
+   常驻在地图上的一行字：接收机现在在干什么、收得怎么样。所有异常也只在这里
+   呈现，不弹对话框——对话框会挡住地图，而且关掉之后问题还在。 */
+#sdrPill{position:absolute;top:12px;left:324px;z-index:4;max-width:calc(100% - 340px);
+         display:flex;align-items:center;gap:8px;padding:7px 12px;border-radius:18px;
+         background:rgba(255,255,255,.96);box-shadow:var(--shadow);font-size:12px;
+         white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+         font-variant-numeric:tabular-nums}
+#sdrPill .dot{width:8px;height:8px;border-radius:50%;flex:none;background:#9ca3af}
+#sdrPill.ok .dot{background:#0e9f6e}
+#sdrPill.warn .dot{background:#d97706}
+#sdrPill.err .dot{background:#dc2626}
+#sdrPill.busy .dot{background:#2563eb;animation:sdrPulse 1.1s ease-in-out infinite}
+#sdrPill.pick{background:#1c2128;color:#fff}
+#sdrPill.pick .dot{background:#fff}
+@keyframes sdrPulse{50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){ #sdrPill.busy .dot{animation:none} }
+
+/* 正在点选接收机位置时，整张地图换十字光标 */
+#wrap.sdr-pick .maplibregl-canvas{cursor:crosshair !important}
+
+/* ---------- 侧栏分组 ---------- */
+.sdr-btns{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.sdr-btn{font:inherit;font-size:12px;padding:4px 10px;border:1px solid var(--line);
+         border-radius:6px;background:#fff;color:inherit;cursor:pointer}
+.sdr-btn:hover{border-color:var(--accent);color:var(--accent)}
+.sdr-btn:disabled{opacity:.5;cursor:default;border-color:var(--line);color:inherit}
+#sdrAdv{margin-top:8px;font-size:12px}
+#sdrAdv summary{cursor:pointer;color:var(--dim);user-select:none}
+#sdrAdv .f{display:flex;align-items:center;gap:8px;margin-top:7px}
+#sdrAdv .f span{flex:none;color:var(--dim)}
+#sdrAdv select{flex:1;padding:4px 6px}
+#sdrDev{margin-top:6px;color:var(--dim);font-size:11px;line-height:1.5;word-break:break-word}

@@ -93,13 +93,57 @@ POI/地名分层标注。各地实测标注数量（离线 vs 在线）：弗吉
 代理端对免费社区服务做了几重克制：同一视口 5 秒内复用缓存、轮询间隔 10 秒、
 标签页切到后台就停、单片半径上限 250 nm 且最多切 4 片、连续 3 次失败自动关闭。
 航线按呼号缓存 1 小时（查不到的也缓存，免得通航机反复打上游）。上游一条记录有
-30+ 字段，代理只透传页面用得上的 9 个并压成定长数组，实测体积降到 12%。
+30+ 字段，代理只透传页面用得上的 10 个并压成定长数组。
+
+## 本地接收机（可选）
+
+默认**关闭**，需要一只 RTL-SDR 接收机。用 `python3 serve.py --sdr` 启动后，自己天线
+收到的飞机会叠加到地图上：每秒更新一次，带航迹，图标套一圈绿边以区别于联网数据。
+它不依赖网络——断网时地图上照样有飞机，只是只有你天线看得见的那些。
+
+```
+brew install librtlsdr readsb uv     # macOS；驱动、ADS-B 解码器、Python 依赖管理
+python3 serve.py --sdr               # 首次启动会自动装依赖，约一分钟
+```
+
+**与联网数据融合**：同一架飞机两边都有时只画一次，位置取更新的那一份（两个来源
+各自带「位置时刻」）；注册号和机型只有联网数据有，本地报文不含，所以取到过就留着。
+本地位置超过 15 秒没更新就让联网数据接手。
+
+**接收机位置**：侧栏「设定接收机位置」后在地图上点一下，会画出 50 / 100 / 150 / 200 nm
+距离圈，以及按方位累计的**实测最远接收轮廓**——哪个方向被楼挡住了一目了然。
+位置存在本机的 `.runtime/sdr.json`，不进仓库，`serve.py` 也拒绝对外提供这个目录。
+
+**地图上方的状态条**随时说明接收机在做什么、收得怎么样；没插上、被别的程序占用、
+缺驱动这类问题也只在那里提示，并说明怎么处理。取消勾选会**真正释放设备**，
+别的 SDR 软件可以接着用。
+
+**结构**：接收机由一个独立的守护进程 `sdr/sdrd` 独占，页面通过 WebSocket 与它通信；
+`serve.py` 只负责把它拉起来、告诉页面端口，自己仍然只用标准库。守护进程把原始采样
+经管道喂给 [readsb](https://github.com/wiedehopf/readsb) 解码。整条进程链靠管道
+跟随父进程的生死：`serve.py` 哪怕被 `kill -9`，守护进程和解码器也会在几秒内自行退出，
+不会留下占着 USB 的孤儿进程。守护进程只监听本机，并校验页面来源，别的网站连不上。
+
+**型号**：界面显示的型号以驱动的认定为准。RTL-SDR Blog V4 靠 USB 字符串
+`RTLSDRBlog / Blog V4` 识别；报 `Realtek / RTL2838UHIDIR` 的是 V3 或通用型号，
+可调谐范围是 24–1766 MHz。ADS-B 在哪种型号上都一样能收。
+
+不插接收机也能看效果：`SDR_SOURCE=synth:adsb:纬度,经度 python3 serve.py --sdr`
+会用合成信号造三架绕该点转圈的假飞机，走的是和真机完全相同的解码链路。
+
+键盘：`1` 开始接收 ADS-B，`0` 关闭并释放设备（在输入框里打字时不生效）。
+
+目前只做了 ADS-B（1090 MHz）。航空话音监听、频谱与瀑布图在后续版本。
+
+⚠️ 接收 ADS-B 广播在多数地区是允许的，但**监听和录制其他无线电通信在部分国家和地区
+受法律限制**，使用前请了解当地规定。
 
 ## 项目结构
 
 ```
 index.html                单页应用（HTML+CSS+JS 全内联，90 KB）
 serve.py                  Range 静态服务器 + /api/flights、/api/route 代理，一个进程全包
+sdr/                      可选的本地接收机：sdrd 守护进程、界面（按需加载）、测试
 start.command             macOS 双击启动器    start.bat  Windows 双击启动器
 data/                     机场数据 + FAA 航图索引（.js 格式，file:// 下也能加载）
 vendor/                   maplibre-gl.js · pmtiles.js · glyphs.js（内嵌拉丁字形）
@@ -186,6 +230,9 @@ AIRAC 周期，`git status` 就会冒出一条 `M data/faa.js`——这不是你
   **仅供仿真使用，真实飞行请用官方现行有效版本。**
 - 实时航班 [adsb.fi](https://adsb.fi/) / [adsb.lol](https://adsb.lol/)（社区众包 ADS-B）
 - 航线查询 [adsbdb](https://www.adsbdb.com/) / [hexdb.io](https://hexdb.io/)
+- 本地接收（可选）：驱动 [librtlsdr](https://osmocom.org/projects/rtl-sdr/wiki)（GPL-2.0+）、
+  解码 [readsb](https://github.com/wiedehopf/readsb)（GPL-3.0+），均需自行安装，不随仓库分发；
+  设备层与部分算法移植自 SDR Lab，见 [sdr/NOTICE.md](sdr/NOTICE.md)
 - 地图引擎 [MapLibre GL JS](https://maplibre.org/) 5.6.1（BSD-3）
 - 字形 Noto Sans Regular（SIL OFL）
 

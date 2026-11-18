@@ -32,8 +32,9 @@
 用法：
     python3 serve.py [端口]        默认 8000
     python3 serve.py --no-update   跳过航图过期检查，直接起服务
+    python3 serve.py --sdr         同时拉起本地接收机守护进程（需要 RTL-SDR，见 README）
 """
-import os, re, sys, json, time, threading, mimetypes, socketserver
+import os, re, sys, json, time, shutil, signal, threading, mimetypes, socketserver
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler
@@ -92,8 +93,12 @@ def tile_bbox(w, sth, e, n):
 def fetch_flights(lat, lon, dist):
     """依次试各数据源，返回瘦身后的 JSON。整条链路失败就抛异常给调用方。
 
-    上游一条记录有 30+ 字段，1400 架就是 800 KB。页面只用得上 9 个字段，
+    上游一条记录有 30+ 字段，1400 架就是 800 KB。页面只用得上 10 个字段，
     压成定长数组后体积降一个量级——和 data/*.js 用定长数组是同一个理由。
+
+    第 10 个字段是「这个位置是什么时候测到的」（Unix 秒）。页面要拿它在多个
+    来源之间挑最新的位置：本地接收机每秒一报，联网数据 10 秒一取还带缓存，
+    没有这个时刻就分不清谁新谁旧，来源一切换飞机就会往回跳。
     """
     last = None
     for name, tpl, key in FLIGHT_SOURCES:
@@ -106,12 +111,25 @@ def fetch_flights(lat, lon, dist):
         except Exception as e:                  # 网络/解析/HTTP 全算失败，换下一家
             last = f"{name}: {e}"
             continue
+        # 位置时刻 = 上游的 now 减去该机的 seen_pos。两家的 now 单位不一样：
+        # 实测 adsb.fi 给秒（1794983108.001），adsb.lol 给毫秒（1794983111002）。
+        # 用上游的钟而不是本机的钟，是因为 seen_pos 是相对上游 now 计的。
+        try:
+            now = float(raw.get("now"))
+            if now > 1e11:
+                now /= 1000.0
+        except (TypeError, ValueError):
+            now = time.time()
         out = []
         for a in raw.get(key) or []:
             la, lo = a.get("lat"), a.get("lon")
             if la is None or lo is None:        # 只有 MLAT/TIS-B 无位置的记录
                 continue
             alt = a.get("alt_baro")
+            try:
+                age = float(a.get("seen_pos") or 0)
+            except (TypeError, ValueError):
+                age = 0.0
             out.append([
                 a.get("hex", ""),
                 (a.get("flight") or "").strip(),
@@ -120,6 +138,7 @@ def fetch_flights(lat, lon, dist):
                 round(la, 5), round(lo, 5),
                 None if alt in ("ground", None) else alt,
                 a.get("gs"), a.get("track"),
+                round(now - age, 1),
             ])
         return {"src": name, "t": int(time.time()), "ac": out}
     raise RuntimeError(last or "no source")
@@ -248,6 +267,131 @@ def route_response(qs):
     return 200, body
 
 
+# ---------- 本地接收机（可选）----------
+# 接收机守护进程 sdr/sdrd 是另一个进程：它要用 numpy 和 WebSocket，而这个文件
+# 坚持只用标准库——不用接收机的人不该为它装任何东西。这里只管三件事：
+# 把它拉起来、告诉页面它在哪个端口、自己退出时把它带走。
+#
+# 「带走」靠的是一根管道而不是信号：守护进程的标准输入连着我们，我们一死
+# （哪怕是 kill -9，来不及发任何信号）管道就断，它读到文件结束便自行退出，
+# 再用同样的办法带走它的解码子进程。整条链上没有谁会变成占着 USB 的孤儿。
+SDR_DIR = os.path.join(ROOT, "sdr")
+# 环境变量只给自动化验收用：它要改接收机位置，不能动使用者自己的设置
+RUNTIME = os.environ.get("AIRPORTS_RUNTIME") or os.path.join(ROOT, ".runtime")
+_sdr = {"enabled": False, "state": "off", "port": None, "reason": "", "proc": None}
+
+
+def _which(name):
+    # 从访达或 Electron 启动时拿不到终端里的 PATH，Homebrew 和 uv 的目录要自己找
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    for d in ("/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin")):
+        if os.path.exists(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return None
+
+
+def _sdr_python():
+    """找一个装好依赖的解释器。返回 (路径, None) 或 (None, 原因)。"""
+    import subprocess
+    venv = os.path.join(SDR_DIR, ".venv", "bin", "python")
+    if not os.path.exists(venv):
+        uv = _which("uv")
+        if uv:
+            # 一次性装依赖。不长期托管 `uv run`：多一层进程，生死跟随就多一处会断
+            _sdr["state"] = "installing"
+            cmd = [uv, "sync", "--project", SDR_DIR]
+            if os.path.exists(os.path.join(SDR_DIR, "uv.lock")):
+                cmd.append("--frozen")
+            try:
+                subprocess.run(cmd, cwd=SDR_DIR, timeout=600, capture_output=True)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    if os.path.exists(venv):
+        return venv, None
+    try:                                        # 没有 uv：当前解释器恰好装了依赖也行
+        ok = subprocess.run([sys.executable, "-c", "import aiohttp, numpy"],
+                            capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if ok:
+        return sys.executable, None
+    return None, "缺少依赖：装好 uv 后重试，或 pip install aiohttp numpy"
+
+
+def _sdr_run(http_port):
+    import subprocess
+    py, why = _sdr_python()
+    if not py:
+        _sdr.update(state="failed", reason=why)
+        print("\n  ⚠ 本地接收机起不来：" + why)
+        return
+    os.makedirs(RUNTIME, exist_ok=True)
+    cmd = [py, "-u", "-m", "sdrd", "--parent-pipe", "--runtime-dir", RUNTIME,
+           # 只放行本页面的来源：别的网站哪怕知道端口也连不上接收机
+           "--allow-origin", "http://localhost:%d" % http_port,
+           "--allow-origin", "http://127.0.0.1:%d" % http_port]
+    try:
+        log = open(os.path.join(RUNTIME, "sdrd.log"), "ab")
+        proc = subprocess.Popen(cmd, cwd=SDR_DIR, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=log)
+    except OSError as e:
+        _sdr.update(state="failed", reason=str(e))
+        return
+    _sdr.update(proc=proc, state="starting")
+    try:
+        ready = json.loads(proc.stdout.readline() or b"{}")
+    except ValueError:
+        ready = {}
+    if ready.get("ready"):
+        _sdr.update(state="running", port=ready["port"], reason="")
+        print("\n  ✓ 本地接收机已启动（端口 %d）" % ready["port"])
+    else:
+        _sdr.update(state="failed", reason=ready.get("error") or "守护进程没有就绪，见 .runtime/sdrd.log")
+        print("\n  ⚠ 本地接收机起不来：" + _sdr["reason"])
+    proc.wait()
+    if _sdr["state"] == "running":
+        _sdr.update(state="exited", port=None, reason="守护进程已退出，见 .runtime/sdrd.log")
+
+
+def sdr_start(http_port):
+    _sdr.update(enabled=True, state="starting")
+    threading.Thread(target=_sdr_run, args=(http_port,), daemon=True).start()
+
+
+def sdr_stop():
+    proc = _sdr.get("proc")
+    if not proc or proc.poll() is not None:
+        return
+    import subprocess
+    try:
+        proc.stdin.close()                      # 管道一关，它自己收场：关设备、关 Bias-T、收解码进程
+        proc.wait(6)
+    except (OSError, subprocess.TimeoutExpired):
+        proc.terminate()
+        try:
+            proc.wait(3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def sdr_response():
+    if _sdr["enabled"]:
+        body = {k: _sdr[k] for k in ("enabled", "state", "port", "reason")}
+    else:
+        # 没用 --sdr，但也许有人手动起了守护进程（开发时常这么干）
+        body = {"enabled": False}
+        try:
+            with open(os.path.join(RUNTIME, "sdrd.json"), encoding="utf-8") as f:
+                info = json.load(f)
+            os.kill(int(info["pid"]), 0)        # 进程不在了会抛异常，旧文件就不算数
+            body = {"enabled": True, "state": "running", "port": int(info["port"]), "reason": ""}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return 200, json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
+
+
 class RangeHandler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"          # Range + keep-alive 都需要 HTTP/1.1
 
@@ -283,9 +427,24 @@ class RangeHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path.split("?", 1)[0] == "/api/sdr":
+            code, body = sdr_response()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         super().do_GET()
 
     def send_head(self):
+        # 点开头的路径一律不给。这个服务器把整个仓库目录当静态文件送出，
+        # 其中 .git/ 是全部历史，.runtime/sdr.json 里有接收机的经纬度——也就是
+        # 使用者的住址。虽然只监听本机，也不该让任何一个本机网页读得到。
+        clean = urllib.parse.unquote(self.path.split("?", 1)[0].split("#", 1)[0])
+        if any(seg.startswith(".") for seg in clean.split("/") if seg):
+            self.send_error(403, "Forbidden")
+            return None
         rng = self.headers.get("Range")
         if not rng:
             return super().send_head()
@@ -486,12 +645,36 @@ if __name__ == "__main__":
         print(f"  {port}-{port+19} 端口都被占用", file=sys.stderr); sys.exit(1)
     print(f"\n  服务目录 {ROOT}")
     print(f"  打开 http://localhost:{port}/\n  Ctrl-C 停止\n")
+    if "--sdr" in sys.argv:
+        print("  本地接收机  启动中…（首次会安装依赖，约一分钟）")
+        sdr_start(port)                     # 端口定下来之后才能起：它要拿端口去限定页面来源
+
+    def _term(*_):                          # 以前只认 Ctrl-C；被 kill 时也得走 finally 把子进程带走
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # 只认第一次：收尾途中再来一个不能把收尾打断
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
+
+    if "--parent-pipe" in sys.argv:
+        # 给 Electron 外壳用：就绪后报一行端口，此后标准输入一断就退出。
+        # 和守护进程跟随我们是同一个办法，外壳被强杀时整条链照样收得干净。
+        print(json.dumps({"ready": True, "port": port}), flush=True)
+
+        def _lifeline():
+            try:
+                while sys.stdin.buffer.read(4096):
+                    pass
+            except (OSError, ValueError):
+                pass
+            httpd.shutdown()
+        threading.Thread(target=_lifeline, daemon=True).start()
+
     if "--open" in sys.argv:
-        import webbrowser, threading
+        import webbrowser
         threading.Timer(0.8, lambda: webbrowser.open(f"http://localhost:{port}/")).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
     finally:
+        sdr_stop()
         httpd.server_close()

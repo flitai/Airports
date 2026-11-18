@@ -38,6 +38,19 @@ Copyright (c) The Noto Project Authors (https://github.com/notofonts/latin-greek
 OFL 允许字体随任意许可证的软件一同分发，与本项目的 GPL-3.0 不冲突；
 但字形数据本身仍属 OFL，衍生字体作品需遵守 OFL 的同名条款。
 
+## sdr/（本地接收机，可选）
+
+`sdr/` 下的代码属于本项目，同样以 GPL-3.0 授权。其中部分模块移植自 SDR Lab，
+逐文件的来源见 [sdr/NOTICE.md](sdr/NOTICE.md)。
+
+运行时调用的两个外部程序**不随本仓库分发**，由使用者自行安装，各自沿用原始授权：
+
+- [librtlsdr](https://osmocom.org/projects/rtl-sdr/wiki) — GPL-2.0-or-later。通过动态库加载调用。
+- [readsb](https://github.com/wiedehopf/readsb) — GPL-3.0-or-later。作为独立子进程运行，经管道交换数据。
+
+Python 依赖 aiohttp（Apache-2.0）与 NumPy（BSD-3-Clause）由 `uv` 安装到 `sdr/.venv/`，
+同样不在仓库中。
+
 ---
 
 # 数据授权
