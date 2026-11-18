@@ -138,12 +138,36 @@ python3 serve.py --sdr               # 首次启动会自动装依赖，约一�
 ⚠️ 接收 ADS-B 广播在多数地区是允许的，但**监听和录制其他无线电通信在部分国家和地区
 受法律限制**，使用前请了解当地规定。
 
+## 桌面外壳（可选）
+
+想要一个独立窗口、不想开终端和浏览器的话，`desktop/` 里有一个 Electron 外壳：
+
+```
+cd desktop
+npm install        # 首次
+npm start          # 带接收机；不用接收机则 npm start -- --no-sdr
+```
+
+Electron 本体不随 `npm install` 下载，而是在第一次 `npm start` 时才取：压缩包 121 MB，
+解开后占 258 MB。从 GitHub 下载慢的话可以换镜像，安装脚本照常核对 SHA-256：
+
+```
+ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm start
+```
+
+它很薄：拉起 `serve.py`、开一个窗口加载同一个页面、退出时把所有子进程带走，
+此外什么都不做。页面与浏览器里看到的完全一样，菜单里的接收机命令也只是向页面
+派发事件。关掉窗口即退出并释放接收机，不会留在程序坞里继续占着设备。
+
+外壳被强制结束时，`serve.py`、接收机守护进程和解码器同样会在几秒内自行退出。
+
 ## 项目结构
 
 ```
 index.html                单页应用（HTML+CSS+JS 全内联，90 KB）
 serve.py                  Range 静态服务器 + /api/flights、/api/route 代理，一个进程全包
 sdr/                      可选的本地接收机：sdrd 守护进程、界面（按需加载）、测试
+desktop/                  可选的 Electron 桌面外壳（main.js 一个文件）
 start.command             macOS 双击启动器    start.bat  Windows 双击启动器
 data/                     机场数据 + FAA 航图索引（.js 格式，file:// 下也能加载）
 vendor/                   maplibre-gl.js · pmtiles.js · glyphs.js（内嵌拉丁字形）

@@ -1,0 +1,14 @@
+{
+  "name": "airports-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Airports 的桌面外壳：开一个窗口，并管住 serve.py 和接收机守护进程的生死",
+  "license": "GPL-3.0-only",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "45.3.4"
+  }
+}
