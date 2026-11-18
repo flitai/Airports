@@ -1,10 +1,15 @@
 """来源校验：这是挡住「任意网页操纵接收机」的唯一一道门，逐条钉死。"""
 import asyncio
 import json
+import os
+import tempfile
+import time
 import unittest
 
 from sdrd.device import describe
-from sdrd.server import AUDIO_BACKLOG, Client, PRIORITY, _host_ok, origin_allowed
+from sdrd.record import Store
+from sdrd.server import AUDIO_BACKLOG, Client, PRIORITY, Server, _host_ok, origin_allowed
+from tests.test_record import META, clip
 
 PAGE = {"http://localhost:8000", "http://127.0.0.1:8000"}
 
@@ -98,6 +103,50 @@ class Backpressure(unittest.TestCase):
         self.assertLessEqual(len(c.audio), AUDIO_BACKLOG)             # 音频最多 500 毫秒
         self.assertLessEqual(len(c.pending), len(PRIORITY))           # 快照每类一份
         self.assertEqual(len(c.spectrum), 3292)                       # 频谱只有一行
+
+
+class RecordingDownload(unittest.TestCase):
+    def test_only_our_page_can_fetch_and_only_our_clips(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Engine:                                    # 这个接口只用到引擎的录音目录
+            pass
+
+        async def go(app, name):
+            got = {}
+            async with TestClient(TestServer(app)) as c:
+                for key, path, headers in (
+                        ("page", "/rec/" + name, {"Origin": "http://localhost:8000"}),
+                        ("script", "/rec/" + name, {}),                              # 测试脚本、curl：没有 Origin
+                        ("other site", "/rec/" + name, {"Origin": "http://evil.example"}),
+                        ("embedded", "/rec/" + name, {"Sec-Fetch-Mode": "no-cors"}),   # 别的网站用 <audio> 标签来取
+                        ("rebinding", "/rec/" + name, {"Host": "evil.example"}),
+                        ("unknown", "/rec/nope.wav", {}),
+                        ("traversal", "/rec/..%2Fsecret.wav", {}),
+                        ("sidecar", "/rec/" + name[:-4] + ".json", {})):
+                    r = await c.get(path, headers=headers)
+                    got[key] = (r.status, r.headers.get("Access-Control-Allow-Origin"), (await r.read())[:4])
+            return got
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "secret.wav"), "w") as f:
+                f.write("x")
+            store = Store(os.path.join(tmp, "recordings"), 1e6)
+            store.add(clip(), META)
+            end = time.time() + 5
+            while not store.snapshot()["count"] and time.time() < end:
+                time.sleep(0.01)
+            name = store.snapshot()["list"][0]["name"]
+            engine = Engine()
+            engine.store = store
+            got = asyncio.run(go(Server(engine, {"http://localhost:8000"}).app, name))
+            store.close()
+        self.assertEqual(got["page"], (200, "http://localhost:8000", b"RIFF"))
+        self.assertEqual(got["script"], (200, None, b"RIFF"))
+        for key in ("other site", "embedded", "rebinding"):
+            self.assertEqual(got[key][0], 403, key)
+        for key in ("unknown", "traversal", "sidecar"):
+            self.assertEqual(got[key][0], 404, key)
 
 
 class Model(unittest.TestCase):

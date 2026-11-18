@@ -34,6 +34,9 @@
 #sdrAdv select{flex:1;padding:4px 6px}
 #sdrDev{margin-top:6px;color:var(--dim);font-size:11px;line-height:1.5;word-break:break-word}
 
+/* 回放：状态条的圆点换成紫色，一眼看出这不是此刻天线收到的 */
+#sdrPill.replay .dot{background:#7c3aed !important;opacity:1 !important}
+
 /* ---------- 话音 ---------- */
 #sdrPill.idle .dot{background:#0e9f6e;opacity:.4}
 #sdrPill .txt{overflow:hidden;text-overflow:ellipsis;min-width:0}
@@ -126,8 +129,12 @@ tr.sdr-cur td{background:rgba(37,99,235,.06)}
 /* 信号列表：窗口里够强的载波，一行一个 */
 #sdrDock .sig{flex:none;width:250px;height:var(--spec-h);display:flex;flex-direction:column;
               border:1px solid var(--line);border-radius:6px;background:#fafbfc;overflow:hidden}
-#sdrDock .sh{flex:none;padding:4px 8px;font-size:10.5px;font-weight:600;color:var(--dim);
-             letter-spacing:.06em;border-bottom:1px solid var(--line);background:#fff}
+#sdrDock .sh{flex:none;display:flex;border-bottom:1px solid var(--line);background:#fff}
+#sdrDock .tb{flex:1;font:inherit;font-size:10.5px;font-weight:600;letter-spacing:.06em;color:var(--dim);
+             padding:5px 8px 3px;border:0;border-bottom:2px solid transparent;background:none;cursor:pointer;
+             font-variant-numeric:tabular-nums}
+#sdrDock .tb:hover{color:var(--accent)}
+#sdrDock .tb.cur{color:var(--accent);border-bottom-color:var(--accent)}
 #sdrDock .sl{flex:1;min-height:0;overflow-y:auto}
 #sdrDock .sn{flex:none;padding:5px 8px;font-size:11px;line-height:1.45;color:var(--dim)}
 #sdrDock .sn:empty{display:none}
@@ -148,6 +155,19 @@ tr.sdr-cur td{background:rgba(37,99,235,.06)}
 #sdrDock .sg .ap{flex:none;font:inherit;font-size:10.5px;padding:0 8px;border:0;
                  border-left:1px solid var(--line);background:none;color:var(--accent);cursor:pointer}
 #sdrDock .sg .ap:hover{background:rgba(37,99,235,.07)}
+
+/* 录音：标题行的开关，正在录时变红并走秒；右侧栏的片段列表沿用信号列表的样子 */
+#sdrDock .rec.live span{color:#dc2626;font-variant-numeric:tabular-nums}
+#sdrDock .rec.live span::before{content:"● "}
+#sdrDock .sg .go .pl{grid-area:1/1;width:11px;font-style:normal;font-size:9px;color:var(--accent);text-align:center}
+#sdrDock .rc .ap{color:var(--dim)}
+#sdrDock .rc .ap:hover{color:#dc2626;background:rgba(220,38,38,.08)}
+#sdrDock .sdr-btn.rec-on{border-color:#dc2626;color:#dc2626;font-variant-numeric:tabular-nums}
+#sdrDock .rn{display:flex;align-items:center;gap:8px}
+#sdrDock .rn span{flex:1;min-width:0}
+#sdrDock .lnk{flex:none;font:inherit;font-size:11px;padding:0;border:0;background:none;color:var(--dim);
+              cursor:pointer;text-decoration:underline}
+#sdrDock .lnk:hover{color:#dc2626}
 
 /* 地图自带的比例尺和缩放按钮在底边，频道条出来时跟着上移 */
 #wrap .maplibregl-ctrl-bottom-left,#wrap .maplibregl-ctrl-bottom-right{bottom:var(--dock-h,0px)}

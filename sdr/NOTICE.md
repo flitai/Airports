@@ -21,6 +21,11 @@ SDR Lab 是一个基于 RTL-SDR Blog V3 的桌面信号探索工作台（Python 
 `sdrd/dsp/xlate.py`（移频、滤波、抽取合成一步）是新写的，取代 `processors.py` 里的全速率混频。
 `sdrd/air.py` 的静噪状态机借鉴了 `sdrlab/trigger.py` 的开关门限加保持时间的思路，代码是新写的。
 
+`sdrd/record.py`（话音触发录音）借鉴了 `sdrlab/trigger.py` 的三条规矩：要有话音才开录、开录时带上此前一小段、
+到了单段上限要等这次发射结束才能再触发。代码是新写的：录的是解调后的音频而不是原始 I/Q，话音判定用解调链
+自带的调制检测而不是语音识别库。同一文件里的原始 I/Q 录制沿用了 SDR Lab「录的时候把此前一小段原始采样也带上」
+的做法（`trigger.py:149-154` 的缓存）；回放时按频点平移频谱（`sdrd/sources.py` 的 `ReplaySource`）是新写的。
+
 `sdrd/engine.py` 对应 SDR Lab 的 `session.py`，行为相近但结构是重写的，没有沿用代码。
 SDR Lab 的纯 Python ADS-B 解码（`modes.py` / `aircraft.py`）没有移植，改由 readsb 承担。
 

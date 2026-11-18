@@ -1,11 +1,14 @@
-"""不需要硬件的采样源：文件回放和合成信号。
+"""不需要硬件的采样源：文件回放、合成信号，以及界面里选一段 I/Q 来回放。
 
 两者和 device.RtlSource 长得一样（open / info / configure / set_gain / start /
 stop / close），引擎分不出区别。它们都按真实时间节拍出块——readsb 在管道那头
 拿采样点数当时钟，喂得比实时快，它的时间就会跑到墙上时间前面去。
 """
+import os
 import threading
 import time
+
+import numpy as np
 
 from . import synth
 from .device import BUF_LEN, DeviceError
@@ -120,6 +123,79 @@ class SynthSource(_Paced):
         if abs(self.center - 1_090_000_000) < self.rate // 2:
             return self.mod.block(BUF_LEN // 2)
         return self.air.block(BUF_LEN // 2, self.center)
+
+
+def shift_block(raw, shift_hz, rng):
+    """把一块 cu8 采样在频率上平移 shift_hz（正数往高处移），移出窗口的丢掉。
+
+    做法是整块做一次 FFT、把频点挪若干格、再变回来。一块 32768 点，一格 73 Hz，
+    所以平移量取整到 73 Hz——差的这点由解调的频率跟踪补上。挪的是整数格，块与块
+    之间相位自然接得上。不能直接乘一个复指数了事：那样移出去的那一截会从窗口另
+    一头绕回来，凭空多出一批假信号。
+    空出来的地方垫一点噪声，看上去是一段安静的频谱，而不是一片死黑。
+    """
+    n = len(raw) // 2
+    k = int(round(shift_hz / (synth.RATE / n)))
+    out = np.zeros(n, np.complex128)
+    if abs(k) < n:
+        a = np.frombuffer(raw, np.uint8).astype(np.float32)
+        a -= 127.5
+        spec = np.fft.fftshift(np.fft.fft(a.view(np.complex64)))
+        moved = np.zeros(n, np.complex128)
+        if k >= 0:
+            moved[k:] = spec[:n - k]
+        else:
+            moved[:n + k] = spec[-k:]
+        out = np.fft.ifft(np.fft.ifftshift(moved))
+    iq = np.empty(2 * n, np.float32)
+    iq[0::2], iq[1::2] = out.real, out.imag
+    iq += rng.normal(127.5, 0.6, 2 * n).astype(np.float32)
+    return np.clip(np.rint(iq), 0, 255).astype(np.uint8).tobytes()
+
+
+class ReplaySource(_Paced):
+    """回放一段录下来的 I/Q，像一台只看得见那 2.4 MHz 的接收机。
+
+    录的时候接收机调在 rec_center。回放时调到同一个中心，采样原样送出；调到别处，
+    就按差值把频谱平移过去——还落在录制范围里的信号出现在它该在的位置，范围以外
+    是空的。于是引擎里划窗口、换频道、画瀑布图的代码一行都不用为回放改。
+    放到头就从头再来。
+    """
+    kind = "replay"
+
+    def __init__(self, path, rec_center, label=""):
+        super().__init__()
+        self.path, self.rec_center, self.label = path, int(rec_center), label
+        self.f = None
+        self.rng = np.random.default_rng(3)
+
+    def open(self):
+        try:
+            self.f = open(self.path, "rb")
+            if os.path.getsize(self.path) < BUF_LEN:
+                raise OSError("文件太短")
+        except OSError as e:
+            raise DeviceError("absent", f"这段 I/Q 打不开：{e}")
+
+    def info(self):
+        return {"model": "回放 · " + self.label, "tuner": "—", "v4": False, "serial": "",
+                "range_hz": [0, 0], "gains": [], "simulated": True}
+
+    def _next_block(self):
+        raw = self.f.read(BUF_LEN)
+        if len(raw) < BUF_LEN:           # 到头了就从头再来；丢掉不满一块的尾巴
+            self.f.seek(0)
+            raw = self.f.read(BUF_LEN)
+        if not raw:
+            return None
+        shift = self.rec_center - self.center
+        return raw if shift == 0 else shift_block(raw, shift, self.rng)
+
+    def close(self):
+        super().close()
+        if self.f:
+            self.f.close()
+            self.f = None
 
 
 def make_source(spec, ppm=0):

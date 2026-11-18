@@ -19,7 +19,7 @@ from .dsp.spectrum import DB_MIN, DB_STEP
 
 # 发送优先级：音频永远最先（单独一条队列，见 Client），其余按这张表，数值小的先发。
 # 频谱排在最后，而且只留最新一行。
-PRIORITY = {"status": 1, "channels": 2, "aircraft": 3, "outline": 4, "candidates": 5}
+PRIORITY = {"status": 1, "channels": 2, "aircraft": 3, "outline": 4, "candidates": 5, "recordings": 6, "iqs": 7}
 AUDIO_BACKLOG = 25                       # 每个页面最多积压 25 帧 = 500 毫秒，再多就丢最旧的
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "[::1]")
 
@@ -101,7 +101,8 @@ class Server:
         self.clients = set()
         self.loop = None
         self.app = web.Application()
-        self.app.add_routes([web.get("/ws", self.ws_handler), web.get("/health", self.health)])
+        self.app.add_routes([web.get("/ws", self.ws_handler), web.get("/health", self.health),
+                             web.get("/rec/{name}", self.recording)])
 
     # 引擎线程调用：把「这几类快照更新了」转交给事件循环
     def notify(self, kinds):
@@ -138,6 +139,7 @@ class Server:
         # 引擎靠这两个数决定「没人听了，回去收 ADS-B」和「没人看，频谱不用算了」
         self.engine.listeners = sum(1 for c in self.clients if c.wants_audio)
         self.engine.watchers = sum(1 for c in self.clients if c.wants_spectrum)
+        self.engine.pages = len(self.clients)        # 回放时一个页面都不剩，就该回到实时接收
 
     def _guard(self, request):
         if not _host_ok(request.headers.get("Host")):
@@ -157,6 +159,25 @@ class Server:
         return web.json_response({"ok": True, "version": __version__, "proto": PROTO,
                                   "status": self.engine.snapshot("status")})
 
+    async def recording(self, request):
+        """一段录音的 WAV。页面用 fetch 来取，所以会带 Origin，照常校验。
+
+        多挡一种情况：别的网站用 <audio src=…> 这类标签来取时，浏览器不带 Origin，
+        _guard 会把它当成非浏览器客户端放行。浏览器发的请求都带 Sec-Fetch-Mode，
+        靠它认出来：是浏览器却没有 Origin，一律拒绝。
+        """
+        self._guard(request)
+        origin = request.headers.get("Origin")
+        if origin is None and "Sec-Fetch-Mode" in request.headers:
+            raise web.HTTPForbidden(text="origin required")
+        path = self.engine.store.path_of(request.match_info["name"])
+        if not path:
+            raise web.HTTPNotFound(text="no such recording")
+        headers = {"Cache-Control": "no-store"}
+        if origin:
+            headers.update({"Access-Control-Allow-Origin": origin, "Vary": "Origin"})
+        return web.FileResponse(path, headers=headers)
+
     async def ws_handler(self, request):
         self._guard(request)
         ws = web.WebSocketResponse(heartbeat=20, max_msg_size=65536)
@@ -166,9 +187,10 @@ class Server:
                                       "modes": ["off", "adsb", "air"],
                                       # 频谱帧的量化常数由这里告诉页面，页面不另抄一份
                                       "spectrum": {"db_min": DB_MIN, "db_step": DB_STEP}}))
-        for kind in ("status", "outline", "aircraft", "channels", "candidates"):   # 连上就给全量，不用等下一拍
+        for kind in ("status", "outline", "aircraft", "channels", "candidates", "recordings", "iqs"):   # 连上就给全量，不用等下一拍
             client.offer(kind, self.engine.snapshot(kind))
         self.clients.add(client)
+        self._count_listeners()
         pump = asyncio.ensure_future(client.pump())
         try:
             async for msg in ws:

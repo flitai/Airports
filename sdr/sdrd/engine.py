@@ -11,11 +11,14 @@
   adsb-pipe        往 readsb 写管道
   sdr-dsp          话音模式下的频谱、静噪和解调（见 air.Monitor）；两种模式下瀑布图的行
   sdr-engine       本文件的 run()：处理命令、开关设备、调谐、轮巡、每秒读一次解码结果
+  sdr-rec*         录音和原始 I/Q 的写盘、删除（见 record.Store / record.IqStore）
 
 采样率全程 2.4 MS/s。模式之间、窗口之间的切换都只是重调谐，设备不关、异步读取
 不停，所以切换是几十毫秒的事。
 页面永远只看 snapshot() 给出的完整快照，界面状态全部由它推出来。
 """
+import collections
+import os
 import queue
 import threading
 import time
@@ -31,7 +34,8 @@ from .dsp import channels as chan
 from .dsp import to_complex
 from .dsp.spectrum import ROW_BLOCKS, ROW_S, Rows, Spectrum, spectrum_frame
 from .geo import RangeOutline
-from .sources import make_source
+from .record import IqStore, Store
+from .sources import ReplaySource, make_source
 
 MODES = ("off", "adsb", "air")       # scan 在后续里程碑加入
 RESTING = ("off", "adsb")            # 能写进设置、重启后接着干的模式；话音要有人在听才有意义
@@ -43,6 +47,7 @@ STUCK_S = 20.0                       # 一个通话频道连续亮了这么久�
 FRESH_S = 60                         # 超过这么久没收到任何报文的飞机不再上报
 CLIP_HIGH, CLIP_LOW = 0.005, 0.0002  # 削顶比例：高于前者降一档增益，低于后者升一档
 SETTLE_S = 0.08                      # 重调谐后这么久之内的采样不拿来画频谱，锁相环还没稳住
+RING_BLOCKS = 110                    # 原始采样的环形缓冲：110 块 = 1.5 秒、7.2 MB。录 I/Q 时放在最前面
 ZERO = {"ac": 0, "ac_pos": 0, "msg_rate": 0}
 
 
@@ -96,6 +101,24 @@ class Engine:
         self._listen_at = 0.0            # 当前这个频道是什么时候开始解调的
         self._manual_id = 10_000
 
+        # ---- 录音 ----
+        self.clip_s = None               # 一段最长多少秒；None 用 record.MAX_S。测试里会改小
+        self.store = Store(os.path.join(run_dir, "recordings"),
+                           float(cfg.get("rec_quota_mb") or 200) * 1e6, self._recordings_changed)
+
+        # ---- 原始 I/Q 的录制与回放 ----
+        # 环形缓冲一直留着最近 1.5 秒的采样（只是引用，不拷贝）。按下「录 I/Q」或话音触发时
+        # 把它放在最前面：等人反应过来去按的时候，想录的那一下往往已经过去了。
+        self.iq = IqStore(os.path.join(run_dir, "iq"), float(cfg.get("iq_quota_mb") or 2000) * 1e6,
+                          self._iqs_changed)
+        self._ring = collections.deque(maxlen=RING_BLOCKS)       # (调谐代号, 采样块)
+        self._iq_lock = threading.Lock()                         # USB 回调与开 / 停录制之间
+        self._iq_clip = False            # 话音触发的这段 I/Q，对应的话音片段存下来了没有
+        self._replay = None              # 正在回放的那一段（IqStore 的条目加上路径）；实时接收时为 None
+        self._replay_prev = self.mode    # 回放结束后回到哪个模式
+        self._replay_alone = None        # 回放着却一个页面都没连着，是从什么时候开始的
+        self.pages = 0                   # 连着几个页面，由服务端维护
+
         # ---- 频谱 ----
         # 频谱不是一种模式：话音和 ADS-B 下都有，有页面在看（watchers）才往外发。
         # 话音模式下谱是解调本来就要算的，白拿；ADS-B 模式下没人看就一格都不算。
@@ -111,6 +134,8 @@ class Engine:
                       "channels": {"t": "channels", "win": 0, "listen": None, "open": False,
                                    "voice": False, "level": {}, "active": [], "steady": []},
                       "candidates": {"t": "candidates", "list": []},
+                      "recordings": dict(self.store.snapshot(), t="recordings"),
+                      "iqs": dict(self.iq.snapshot(), t="iqs"),
                       "outline": dict(self.outline.to_json(), t="outline")}
         self._snap["status"] = self._status({})
 
@@ -140,6 +165,8 @@ class Engine:
         mode = op.get("mode")
         if mode not in MODES:
             return {"ok": False, "code": "bad_mode", "msg": "这个模式尚未实现"}
+        if mode == "off" and self._replay:   # 关闭就是关闭：回放也一并结束
+            self._replay_stop()
         if mode == "air" and not self.air:
             return {"ok": False, "code": "no_channels",
                     "msg": "还没选频道：打开一个机场，在频率表里点「收听」"}
@@ -151,7 +178,7 @@ class Engine:
             if self.mode != "air":
                 self._return_to = self.mode
             self._idle_since = self._idle_left = None
-        else:
+        elif not self._replay:           # 回放时切的模式只是为了看那段录制，不是重启后要接着干的事
             self.cfg.set(mode=mode)
         self.mode = mode
         self._retry_at = 0.0             # 用户刚点过，别让他等重试间隔
@@ -197,6 +224,12 @@ class Engine:
             self.cfg.set(voice_only=bool(op["voice_only"]))
             if self.monitor:
                 self.monitor.voice_only = bool(op["voice_only"])
+        if "iq_with_voice" in op:
+            self.cfg.set(iq_with_voice=bool(op["iq_with_voice"]))
+        if "record" in op:
+            self.cfg.set(record=bool(op["record"]))
+            if self.monitor:
+                self.monitor.record = bool(op["record"])
         if "patrol" in op:
             if not self.air:
                 return {"ok": False, "code": "no_channels", "msg": "还没选频道"}
@@ -320,14 +353,17 @@ class Engine:
         air, src = self.air, self.source
         w = air["windows"][win]
         self._gen += 1                   # 先作废排队中的旧块，再动硬件
-        self.monitor = None
+        self._drop_monitor()
+        self._iq_stop("retune")          # 一段 I/Q 只有一个中心频率
         try:
             src.tune(w["center_hz"])
         except DeviceError as e:
             self.error, self._lost = str(e), True
             return
         mon = Monitor(w["center_hz"], [self._channel(i) for i in w["ch"]],
-                      self.cfg.get("squelch_db"), self._audio_out, bool(self.cfg.get("voice_only")))
+                      self.cfg.get("squelch_db"), self._audio_out, bool(self.cfg.get("voice_only")),
+                      self._clip_out, self.clip_s)
+        mon.record = bool(self.cfg.get("record"))
         mon.gen = self._gen
         if air["listen"] not in w["ch"]:
             air["listen"] = self._best_in(win)
@@ -336,6 +372,152 @@ class Engine:
         self.monitor = mon
         self._tuned_at = self._listen_at = time.monotonic()
         self._hold_until = 0.0
+
+    def _drop_monitor(self):
+        """不再用当前这个 Monitor 了。它正在录的那段先收尾交出去，别丢。"""
+        mon, self.monitor = self.monitor, None
+        if mon:
+            mon.end_clip()
+
+    def _clip_out(self, ch, clip):
+        """sdr-dsp 或引擎线程：录完一段。补上「这是哪个机场的哪个频道」，交给写盘线程。"""
+        air = self.air or {}
+        meta = {"hz": ch["hz"], "label": ch["label"], "type": ch["type"], "desc": ch["desc"],
+                "spacing": ch["spacing"], "airport": air.get("airport"), "airport_label": air.get("label") or ""}
+        cur = self.iq.active()
+        if cur and cur["kind"] == "voice":           # 同时在录这一段的 I/Q：两边互相指一下
+            meta["iq"] = cur["name"]
+            self._iq_clip = True
+        if self._replay:
+            meta["replay_of"] = self._replay["name"]   # 这段话音是从回放里录的，不是当时现场的
+        self.store.add(clip, meta)
+
+    def _recordings_changed(self):
+        self._publish(recordings=dict(self.store.snapshot(), t="recordings"))
+
+    def _op_record(self, op):
+        """删一段，或者全部清空。开关录音走 set（它是一项设置，和静噪门限一样要存盘）。"""
+        if op.get("clear") is True:
+            self.store.clear()
+        elif self.store.path_of(op.get("delete")):
+            self.store.delete(op["delete"])
+        else:
+            return {"ok": False, "code": "bad_recording", "msg": "没有这段录音"}
+        return {"ok": True}
+
+    # ---- 原始 I/Q：录 ----
+    def _iqs_changed(self):
+        self._publish(iqs=dict(self.iq.snapshot(), t="iqs"))
+
+    def _iq_start(self, kind):
+        """开录当前整窗的 I/Q。kind：manual（按了按钮）或 voice（跟着话音触发）。"""
+        src = self.source
+        if not src or self._replay or self._rf not in ("adsb", "air") or self.iq.active():
+            return False
+        air = self.air if self._rf == "air" else None
+        meta = {"kind": kind, "mode": self._rf, "center_hz": src.center, "rate_hz": adsb.RATE, "gain_db": src.gain,
+                "device": self.device.get("model", "")}
+        if air:
+            # 回放时要靠这些把当时的频道表原样摆回来
+            listen = self._channel(air["listen"])
+            # 每个频道连同它对应频率表的哪几行一起记下：页面靠行号把指示灯点回频率表上
+            meta.update(airport=air["airport"], airport_label=air["label"], listen=listen and listen["label"],
+                        channels=[[c["type"], c["desc"], c["label"], c["rows"]] for c in air["channels"]])
+        with self._iq_lock:
+            pre = [b for g, b in self._ring if g == self._gen]   # 只要这次调谐之后的：之前的是别的频率
+            self._iq_clip = False
+            self.iq.begin(meta, pre, time.time() - len(pre) * len(pre[0]) / (2 * adsb.RATE) if pre else time.time())
+        return True
+
+    def _iq_stop(self, reason, keep=True):
+        with self._iq_lock:
+            self.iq.end(reason, keep)
+
+    def _iq_tick(self, now):
+        """每 0.2 秒一次：手动的到时长就停；话音触发的跟着话音片段开和停。"""
+        cur = self.iq.active()
+        mon = self.monitor
+        tuned = mon.tuned if mon else None
+        talking = bool(tuned and tuned[3].active)
+        if cur:
+            if cur["kind"] == "manual":
+                if cur["s"] >= float(self.cfg.get("iq_max_s") or 60) + RING_BLOCKS * 65536 / (2 * adsb.RATE):
+                    self._iq_stop("limit")
+            elif not talking:
+                # 话音片段结束了。它要是被当成噪声丢掉了，这段 I/Q 也不留
+                self._iq_stop("clip", keep=self._iq_clip)
+        elif talking and self.cfg.get("iq_with_voice") and self.cfg.get("record") and self._rf == "air":
+            self._iq_start("voice")
+
+    def _op_iq(self, op):
+        """手动开 / 停一段 I/Q，删一段，或者全部清空。"""
+        if op.get("clear") is True:
+            if self._replay:
+                self._replay_stop()
+            self._iq_stop("cleared", keep=False)
+            self.iq.clear()
+            return {"ok": True}
+        if "delete" in op:
+            name = op["delete"]
+            if not self.iq.path_of(name):
+                return {"ok": False, "code": "bad_recording", "msg": "没有这段 I/Q"}
+            if self._replay and self._replay["name"] == name:
+                self._replay_stop()                  # 正在放的这段要删：先回到实时
+            self.iq.delete(name)
+            return {"ok": True}
+        if op.get("on"):
+            if self._replay:
+                return {"ok": False, "code": "replaying", "msg": "正在回放，录下来的只会是同一段。先返回实时接收"}
+            cur = self.iq.active()
+            if cur:                                  # 话音触发的那段正录着：接过来，改成手动的，由人来停
+                self.iq.cur["meta"]["kind"] = "manual"
+                return {"ok": True}
+            if not self._iq_start("manual"):
+                return {"ok": False, "code": "not_receiving", "msg": "接收机还没在收，没有东西可录"}
+        else:
+            self._iq_stop("stopped")
+        return {"ok": True}
+
+    # ---- 原始 I/Q：回放 ----
+    def _op_replay(self, op):
+        if op.get("off") is True:
+            if self._replay:
+                self._replay_stop()
+            return {"ok": True}
+        name = op.get("name")
+        path, item = self.iq.path_of(name), self.iq.item(name)
+        if not path or not item:
+            return {"ok": False, "code": "bad_recording", "msg": "没有这段 I/Q"}
+        if not self._replay:                         # 从一段换到另一段时，「回到哪儿」仍是最初那个模式
+            self._replay_prev = self.mode if self.mode in RESTING else self._return_to
+        self._close("released")                      # 放开真接收机；正在录的 I/Q 也就此收尾
+        self._replay = dict(item, path=path)
+        self.mode = "adsb"
+        saved = item.get("channels") or []
+        channels = chan.build(saved) if item.get("mode") == "air" else []
+        if len(channels) == len(saved):              # 一一对应（存的时候就是一个载波一条）：把行号摆回去
+            for c, row in zip(channels, saved):
+                c["rows"] = list(row[3]) if len(row) > 3 and isinstance(row[3], list) else []
+                if not c["rows"]:
+                    c["manual"] = True               # 没有行号的是当时手动调出来的
+        if channels:
+            pick = next((c["id"] for c in channels if c["label"] == item.get("listen")), None)
+            self._set_plan(channels, pick, item.get("airport_label") or "", item.get("airport"))
+            self._return_to = "adsb"
+        elif item.get("mode") == "air":              # 说明里没有频道表（不该发生）：调到中心旁边的格点上
+            self.air = None
+            self._op_tune({"hz": item["center_hz"] + chan.HALF_GRID})
+            self._return_to = "adsb"
+        self._retry_at = 0.0
+        return {"ok": True}
+
+    def _replay_stop(self):
+        """回到实时接收：放开回放文件，按原来的模式重新打开真接收机。"""
+        self._close("released")
+        self._replay = self._replay_alone = None
+        self.mode = self._replay_prev
+        self._idle_since = self._idle_left = None
+        self._retry_at = 0.0
 
     def _audio_out(self, frame):
         self._frames += 1
@@ -431,12 +613,16 @@ class Engine:
         return rows
 
     OPS = {"mode": _op_mode, "home": _op_home, "set": _op_set, "channels": _op_channels,
-           "listen": _op_listen, "window": _op_window, "tune": _op_tune, "drop": _op_drop}
+           "listen": _op_listen, "window": _op_window, "tune": _op_tune, "drop": _op_drop,
+           "record": _op_record, "iq": _op_iq, "replay": _op_replay}
 
     # ---- 采样块入口（采样源线程）----
     def _on_block(self, block):
         self._blocks += 1
         self._last_block = time.monotonic()
+        with self._iq_lock:              # 不争用时只是几十纳秒；写盘在别的线程里
+            self._ring.append((self._gen, block))
+            self.iq.feed(block)
         rf = self._rf
         if rf == "adsb":
             dec = self.decoder
@@ -464,7 +650,9 @@ class Engine:
     # ---- 把现实拉到期望上 ----
     def _open(self):
         self.device = dict(self.device, state="opening")
-        src = make_source(self.source_spec, ppm=self.cfg.get("ppm") or 0)
+        rp = self._replay
+        src = ReplaySource(rp["path"], rp["center_hz"], rp["name"]) if rp \
+            else make_source(self.source_spec, ppm=self.cfg.get("ppm") or 0)
         try:
             src.open()
             gain = self.cfg.get("gain")
@@ -472,6 +660,9 @@ class Engine:
             src.configure(adsb.CENTER, adsb.RATE, float(start_gain))
         except DeviceError as e:
             src.close()
+            if rp:                       # 回放文件打不开：别在这儿反复重试，回到实时接收
+                self._replay, self.mode, self.error = None, self._replay_prev, str(e)
+                return
             self.device = dict(self.device, state=e.code)
             self.error = str(e)
             self._retry_at = time.monotonic() + RETRY_S
@@ -498,7 +689,9 @@ class Engine:
             self.decoder.stop(wait=False)
             self.decoder = None
             self._publish(aircraft={"t": "aircraft", "list": []})
-        self._rf, self.monitor = None, None
+        self._rf = None
+        self._drop_monitor()
+        self._iq_stop("retune")
         if want == "adsb":
             self._gen += 1               # 作废排队中的旧块，见 _tune_window
             try:
@@ -520,13 +713,15 @@ class Engine:
             self.decoder.start()
 
     def _close(self, state="released", wait=False):
+        self._iq_stop("closed")
         if self.source:
             self.source.close()          # 先停采样再关解码，免得往已关的管道里写
             self.source = None
         if self.decoder:
             self.decoder.stop(wait)      # 不等它收尾，见 adsb.ReadsbDecoder.stop
             self.decoder = None
-        self._rf, self.monitor = None, None
+        self._rf = None
+        self._drop_monitor()
         self.device = dict(self.device, state=state)
         self._publish(aircraft={"t": "aircraft", "list": []})
 
@@ -572,7 +767,8 @@ class Engine:
             rows.append(row)
             if row[2] is not None:
                 with_pos += 1
-                if a.get("seen_pos", 99) < 5 and self.outline.update(row[2], row[3]):
+                # 回放出来的位置是过去的，不能算进「这台接收机最远收到哪儿」
+                if a.get("seen_pos", 99) < 5 and not self._replay and self.outline.update(row[2], row[3]):
                     grew = True
         self._publish(aircraft={"t": "aircraft", "list": rows})
         if grew:
@@ -613,6 +809,11 @@ class Engine:
                 "audio": {"listeners": self.listeners, "frames": self._frames,
                           "dsp_drops": self._dsp_drops},
                 "spectrum": {"watchers": self.watchers, "rows": self._row_seq},
+                "rec": dict(self.store.stats(), on=bool(self.cfg.get("record"))),
+                "iq": dict(self.iq.stats(), with_voice=bool(self.cfg.get("iq_with_voice")),
+                           max_s=float(self.cfg.get("iq_max_s") or 60), active=self.iq.active()),
+                "replay": {k: self._replay.get(k) for k in ("name", "center_hz", "duration_s", "mode", "airport_label",
+                                                            "start")} if self._replay else None,
                 "return_to": self._return_to,
                 "auto_return_s": self._idle_left if self.mode == "air" else None,
                 "warnings": warnings}
@@ -641,6 +842,7 @@ class Engine:
                 now = time.monotonic()
                 if now < next_tick:
                     self._air_tick(now)
+                    self._iq_tick(now)
                     continue
                 next_tick = now + 1.0
                 if self._lost and self.source:       # 被拔掉了
@@ -656,13 +858,20 @@ class Engine:
                 elif self.mode != "off" and not self.source and now >= self._retry_at:
                     self._open()
                 if self.mode == "air":               # 没人听了就倒计时，到点回去接着收 ADS-B
-                    if self.listeners > 0:
+                    if self.listeners > 0 or self.cfg.get("record"):     # 开着录音就是有事在做，不算没人听
                         self._idle_since = self._idle_left = None
                     else:
                         self._idle_since = self._idle_since or now
                         self._idle_left = max(0, round(self.auto_return_s - (now - self._idle_since)))
                         if now - self._idle_since >= self.auto_return_s:
-                            self._set_mode(self._return_to)
+                            if self._replay:         # 没人听的回放没有意义，还占着接收机回不来
+                                self._replay_stop()
+                            else:
+                                self._set_mode(self._return_to)
+                if self._replay:                     # 回放是给人看的。页面都走了还放着，真接收机就一直回不来
+                    self._replay_alone = None if self.pages else (self._replay_alone or now)
+                    if self._replay_alone and now - self._replay_alone >= self.auto_return_s:
+                        self._replay_stop()
                 part = {}
                 if self.source:
                     self._sync_rf()
@@ -678,3 +887,5 @@ class Engine:
             # 管道一断它必然自己走，而且它不碰 USB。我们早走一步，文件锁和接收机
             # 就早一步让出来——用户退出后立刻重开，新的守护进程才不会撞上「已在运行」。
             self._close("released", wait=False)
+            self.store.close()                       # 最后一段写完再走
+            self.iq.close()

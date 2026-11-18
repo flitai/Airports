@@ -1,13 +1,15 @@
 #!/bin/zsh
 # 浏览器端验收：用无头 Chrome 驱动真实页面，经 window.__probe / __act 断言。
-# 用法：sdr/tests/browser/run.sh [base|receiver|voice|spectrum|all]      （默认 all）
+# 用法：sdr/tests/browser/run.sh [base|receiver|voice|spectrum|record|iq|all]      （默认 all）
 #
 #   base      不启用接收机：联网航班、多来源合并、切底图；以及 file:// 模式
 #   receiver  用合成 ADS-B 信号走完整链路：serve.py → sdrd → readsb → 页面
 #   voice     用合成的话音台验话音监听：频率表里点收听 → 调谐 → 解调 → 页面出声
 #   spectrum  频谱与瀑布图：两种模式下的行速率、点击调谐、信号列表
+#   record    话音触发录音：自动存片段、回放、删除，干扰载波不录
+#   iq        原始 I/Q：手动录、跟着话音触发录、在界面里回放、返回实时
 #
-# receiver、voice 和 spectrum 会改接收机位置、静噪这些设置，所以各用一个临时的运行目录，
+# 除 base 外各组都会改接收机位置、静噪这些设置（record 还会写录音），所以各用一个临时的运行目录，
 # 不碰 .runtime/sdr.json 里你自己的设置。
 set -u
 ROOT=${0:A:h:h:h:h}; HERE=${0:A:h}; WHAT=${1:-all}
@@ -68,6 +70,20 @@ if [[ $WHAT == spectrum || $WHAT == all ]]; then
   export SDR_SOURCE="$SYNTH,119.3~3/3*400" AIRPORTS_RUNTIME="$TMP/runtime-spectrum" SDR_AUTO_RETURN_S=600
   serve --sdr; chrome
   node "$HERE/spectrum.mjs" $DBG "http://localhost:$PORT/" || RC=1
+  stop
+fi
+if [[ $WHAT == record || $WHAT == all ]]; then
+  echo "===== 话音触发录音 · 合成信号 ====="
+  export SDR_SOURCE="$SYNTH" AIRPORTS_RUNTIME="$TMP/runtime-record" SDR_AUTO_RETURN_S=8
+  serve --sdr; chrome
+  node "$HERE/record.mjs" $DBG "http://localhost:$PORT/" || RC=1
+  stop
+fi
+if [[ $WHAT == iq || $WHAT == all ]]; then
+  echo "===== 原始 I/Q 的录制与回放 · 合成信号 ====="
+  export SDR_SOURCE="$SYNTH" AIRPORTS_RUNTIME="$TMP/runtime-iq" SDR_AUTO_RETURN_S=600
+  serve --sdr; chrome
+  node "$HERE/iq.mjs" $DBG "http://localhost:$PORT/" || RC=1
   stop
 fi
 exit $RC

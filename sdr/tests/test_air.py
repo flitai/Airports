@@ -4,6 +4,7 @@ import struct
 import tempfile
 import time
 import unittest
+import wave
 
 import numpy as np
 
@@ -303,6 +304,81 @@ class Air(unittest.TestCase):
         n1 = len(rows)
         time.sleep(0.7)
         self.assertEqual(len(rows), n1)
+
+    def test_voice_triggered_recording(self):
+        """没有任何页面在听：录音照样自己触发、自己存盘。"""
+        # 地面说 3 秒停 3 秒；125.0 是一根不带调制的干扰载波；塔台连续播发。三个台各在一个窗口里
+        self.eng.stop()
+        self.eng = Engine(self.cfg, "synth:adsb:48,11;air:121.9~3/3*700,125.0%0,118.5", self.tmp.name)
+        self.eng.listeners = 0
+        self.eng.auto_return_s = 999
+        self.eng.start()
+        recs = lambda: self.eng.snapshot("recordings")
+        folder = os.path.join(self.tmp.name, "recordings")
+        table = [["GND", "Ground", "121.9"], ["TWR", "bare carrier", "125.0"], ["TWR", "Tower", "118.5"]]
+        self.cmd(op="channels", label="Test Field", airport=7, list=table, pick=0)
+        self.assertTrue(wait_for(lambda: self.chan()["voice"], 8))
+        time.sleep(1.0)
+        self.assertEqual((recs()["count"], self.eng.snapshot("status")["rec"]["on"]), (0, False))   # 没开录音就不录
+        self.assertTrue(self.cmd(op="set", record=True)["ok"])
+        self.assertTrue(wait_for(lambda: self.chan()["rec_s"], 8))               # 正在录的这段已经多长，给页面显示用
+        self.assertTrue(wait_for(lambda: recs()["count"] >= 2, 16))              # 头一段可能是半句，看第二段
+        item = recs()["list"][0]
+        self.assertEqual((item["hz"], item["label"], item["type"], item["airport"], item["airport_label"], item["end"]),
+                         (121_900_000, "121.900", "GND", 7, "Test Field", "closed"))
+        self.assertAlmostEqual(item["speech_s"], 3.0, delta=0.4)
+        self.assertAlmostEqual(item["pre_s"], 0.5, delta=0.05)
+        self.assertTrue(3.5 <= item["duration_s"] <= 4.5, item["duration_s"])    # 留白 + 3 秒通话 + 静噪关闭前的尾巴
+        self.assertGreater(item["peak_db"], 30)
+        self.assertLess(abs(time.time() - item["start"] - item["duration_s"]), 3)
+        with wave.open(os.path.join(folder, item["name"])) as w:
+            self.assertEqual((w.getnchannels(), w.getsampwidth(), w.getframerate()), (1, 2, 16000))
+            pcm = np.frombuffer(w.readframes(w.getnframes()), "<i2").astype(float)
+        self.assertAlmostEqual(len(pcm) / 16000, item["duration_s"], delta=0.01)
+        self.assertLess(np.abs(pcm[:4000]).max(), 200)                           # 开头四分之一秒是载波出现之前：安静
+        body = pcm[16000:40000]
+        self.assertGreater(np.sqrt(np.mean(body ** 2)), 3000)
+        self.assertAlmostEqual(float(np.argmax(np.abs(np.fft.rfft(body * np.hanning(len(body))))) * 16000 / len(body)),
+                               700, delta=20)                                    # 录下来的就是地面那个 700 Hz
+        self.assertTrue(os.path.exists(os.path.join(folder, item["name"][:-4] + ".json")))
+
+        # 持续的干扰载波：没有话音，一段也不录
+        self.cmd(op="listen", ch=1)
+        self.assertTrue(wait_for(lambda: self.chan()["listen"] == 1 and self.chan()["open"], 5))
+        n = wait_for(lambda: recs()["count"], 1) and recs()["count"]             # 换频道时正在录的那段先收尾
+        time.sleep(4)
+        self.assertEqual((recs()["count"], self.chan()["rec_s"]), (n, None))
+
+        # 连续播发的台：只录一段，到上限为止，不会一段接一段把磁盘写满
+        self.eng.clip_s = 1.5
+        self.cmd(op="listen", ch=2)
+        self.assertTrue(wait_for(lambda: recs()["count"] == n + 1, 8))
+        time.sleep(4)
+        self.assertEqual(recs()["count"], n + 1)
+        cap = recs()["list"][0]
+        self.assertEqual((cap["label"], cap["end"]), ("118.500", "limit"))
+        # 上限从开录那一刻算起，不含前置留白（刚调过来，留白还没攒满半秒）
+        self.assertAlmostEqual(cap["duration_s"] - cap["pre_s"], 1.5, delta=0.1)
+
+        # 开着录音就不算「没人听」：不倒计时，不自动回去
+        self.eng.auto_return_s = 1
+        time.sleep(3)
+        st = self.eng.snapshot("status")
+        self.assertEqual((st["mode"], st["auto_return_s"], st["rec"]["on"], st["rec"]["count"]), ("air", None, True, n + 1))
+        self.assertTrue(Config(os.path.join(self.tmp.name, "sdr.json")).get("record"))
+
+        # 删一段、清空
+        self.assertEqual(self.cmd(op="record", delete="../sdr.json")["code"], "bad_recording")
+        self.assertTrue(self.cmd(op="record", delete=cap["name"])["ok"])
+        self.assertTrue(wait_for(lambda: recs()["count"] == n, 3))
+        self.assertFalse(os.path.exists(os.path.join(folder, cap["name"])))
+        self.assertTrue(self.cmd(op="record", clear=True)["ok"])
+        self.assertTrue(wait_for(lambda: recs()["count"] == 0, 3))
+        self.assertEqual(os.listdir(folder), [])
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "sdr.json")))   # 清空只动录音目录
+        # 关掉录音：没人听，这回该回去了
+        self.assertTrue(self.cmd(op="set", record=False)["ok"])
+        self.assertTrue(wait_for(lambda: self.eng.snapshot("status")["mode"] == "off", 6))
 
     def test_returns_when_nobody_listens(self):
         self.cmd(op="mode", mode="adsb")
