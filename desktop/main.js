@@ -20,14 +20,29 @@ if (process.env.ELECTRON_RUN_AS_NODE) {
                 "请在普通终端里运行，或先执行 unset ELECTRON_RUN_AS_NODE。");
   process.exit(1);
 }
-const { app, BrowserWindow, Menu, shell, session } = require("electron");
+const { app, BrowserWindow, Menu, shell, session, dialog } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
-const ROOT = path.join(__dirname, "..");
+// 从仓库里 npm start 时，页面和 serve.py 就在上一级目录。打包成应用后（见
+// build-app.sh）它们被拷进应用包的 Resources/airports 里。
+const ROOT = app.isPackaged ? path.join(process.resourcesPath, "airports") : path.join(__dirname, "..");
 const WITH_SDR = !process.argv.includes("--no-sdr");
+
+// 打包后的应用不往自己的包里写东西：设置、接收机的运行期状态、Python 依赖都放在
+// 用户数据目录（~/Library/Application Support/Airports）。应用包因此可以放在只读
+// 的地方，换新版本时这些也不会丢。
+const DATA = app.getPath("userData");
+const settingsFile = path.join(DATA, "settings.json");
+function loadSettings() {
+  try { return JSON.parse(fs.readFileSync(settingsFile, "utf8")) || {}; } catch (_e) { return {}; }
+}
+function saveSettings(s) {
+  try { fs.mkdirSync(DATA, { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify(s, null, 1)); }
+  catch (_e) { /* 记不住就算了 */ }
+}
 const PORT = 8000;                    // 起点；被占用时 serve.py 会自己顺延，以它报回来的为准
 
 let win = null, child = null, baseUrl = null;
@@ -58,6 +73,14 @@ function start() {
   const env = Object.assign({}, process.env, {
     PATH: extra.concat((process.env.PATH || "").split(path.delimiter)).join(path.delimiter),
   });
+  if (app.isPackaged) {
+    env.AIRPORTS_RUNTIME = path.join(DATA, "runtime");
+    env.UV_PROJECT_ENVIRONMENT = path.join(DATA, "sdr-venv");
+    env.PYTHONDONTWRITEBYTECODE = "1";            // 别在应用包里留 __pycache__
+  }
+  // 离线瓦片有一百多 GB，不在应用包里。用户在菜单里选过目录就用那个目录
+  const tiles = loadSettings().tiles;
+  if (tiles && fs.existsSync(tiles)) env.AIRPORTS_TILES = tiles;
   const args = ["-u", "serve.py", String(PORT), "--parent-pipe"];   // -u：不加的话就绪行会留在缓冲区里出不来
   if (WITH_SDR) args.push("--sdr");
   child = spawn("python3", args, { cwd: ROOT, env, stdio: ["pipe", "pipe", "pipe"] });
@@ -162,11 +185,42 @@ function toPage(name, arg) {
   ).catch(() => {});
 }
 
+// 选离线瓦片所在的目录（里面放着 planet.pmtiles 和 dem/）。serve.py 是带着这个路径
+// 启动的，所以选完要重启一次才生效。
+function chooseTiles() {
+  const s = loadSettings();
+  dialog.showOpenDialog(win, {
+    title: "选择离线瓦片目录", message: "选择放着 planet.pmtiles（和 dem/）的那个目录",
+    defaultPath: s.tiles || os.homedir(), properties: ["openDirectory"],
+  }).then((r) => {
+    if (r.canceled || !r.filePaths[0]) return;
+    s.tiles = r.filePaths[0];
+    saveSettings(s);
+    app.relaunch();
+    app.quit();
+  });
+}
+function forgetTiles() {
+  const s = loadSettings();
+  delete s.tiles;
+  saveSettings(s);
+  app.relaunch();
+  app.quit();
+}
+
 function buildMenu() {
   const tpl = [];
   if (process.platform === "darwin") tpl.push({ role: "appMenu" });
   tpl.push({ role: "editMenu" });               // 搜索框里的复制粘贴靠它
   tpl.push({ role: "viewMenu" });
+  const tilesNow = loadSettings().tiles;
+  tpl.push({ label: "底图", submenu: [
+    { label: "选择离线瓦片目录…", click: chooseTiles },
+    { label: "不使用外部瓦片目录", enabled: !!tilesNow, click: forgetTiles },
+    { type: "separator" },
+    { label: tilesNow ? "当前：" + tilesNow : (app.isPackaged ? "当前：未选择，离线底图为内置简图" : "当前：仓库里的 tiles/"),
+      enabled: false },
+  ] });
   if (WITH_SDR) {
     tpl.push({ label: "接收机", submenu: [
       { label: "接收 ADS-B", accelerator: "CmdOrCtrl+1", click: () => toPage("mode", "adsb") },

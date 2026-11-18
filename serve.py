@@ -40,6 +40,9 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+# 离线瓦片默认在仓库目录的 tiles/ 下。打包成应用之后程序本身在应用包里，而瓦片有
+# 一百多 GB，不可能也不应该放进包里：用这个环境变量把 /tiles/ 指到包外的目录。
+TILES = os.environ.get("AIRPORTS_TILES") or os.path.join(ROOT, "tiles")
 RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)$")
 
 mimetypes.add_type("application/octet-stream", ".pmtiles")
@@ -295,7 +298,10 @@ def _which(name):
 def _sdr_python():
     """找一个装好依赖的解释器。返回 (路径, None) 或 (None, 原因)。"""
     import subprocess
-    venv = os.path.join(SDR_DIR, ".venv", "bin", "python")
+    # UV_PROJECT_ENVIRONMENT 是 uv 自己认的变量：依赖装到哪儿由它定。打包后的应用
+    # 用它把虚拟环境放到用户数据目录，不往应用包里写东西。
+    venv = os.path.join(os.environ.get("UV_PROJECT_ENVIRONMENT") or os.path.join(SDR_DIR, ".venv"),
+                        "bin", "python")
     if not os.path.exists(venv):
         uv = _which("uv")
         if uv:
@@ -437,6 +443,14 @@ class RangeHandler(SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
+    def translate_path(self, path):
+        # /tiles/ 可以落在仓库之外（见 TILES）。其余路径照旧相对 ROOT。
+        clean = urllib.parse.unquote(path.split("?", 1)[0].split("#", 1)[0])
+        parts = [p for p in clean.split("/") if p and p not in (".", "..")]
+        if parts and parts[0] == "tiles":
+            return os.path.join(TILES, *parts[1:])
+        return super().translate_path(path)
+
     def send_head(self):
         # 点开头的路径一律不给。这个服务器把整个仓库目录当静态文件送出，
         # 其中 .git/ 是全部历史，.runtime/sdr.json 里有接收机的经纬度——也就是
@@ -523,7 +537,7 @@ def dem_levels():
     要精确校验完整性用 download_offline_maps.py --check。
     """
     try:
-        zs = sorted(int(d) for d in os.listdir(os.path.join(ROOT, "tiles", "dem"))
+        zs = sorted(int(d) for d in os.listdir(os.path.join(TILES, "dem"))
                     if d.isdigit())
     except OSError:                         # 目录不存在或读不了
         return None
@@ -536,7 +550,7 @@ def dem_levels():
 
 def status():
     def size(p):
-        p = os.path.join(ROOT, p)
+        p = os.path.join(TILES, p[6:]) if p.startswith("tiles/") else os.path.join(ROOT, p)
         if os.path.isfile(p):
             return os.path.getsize(p)
         if os.path.isdir(p):

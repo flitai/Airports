@@ -35,6 +35,7 @@ regions.csv
 SDR-Lab/
 .runtime/
 node_modules/
+desktop/dist/
 
 # ---------------------------------------------------------------
 # Python / 编辑器 / 系统噪声

@@ -187,6 +187,19 @@ ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm start
 
 外壳被强制结束时，`serve.py`、接收机守护进程和解码器同样会在几秒内自行退出。
 
+**打成应用**（macOS）：`sh desktop/build-app.sh`（或在 `desktop/` 里 `npm run package`），
+产物是 `desktop/dist/Airports.app` 和一个 zip。它直接改装 `node_modules` 里那份
+Electron，不用再联网下载。打出来的仍是薄壳，不是自带一切的应用：
+
+- 目标机器上要有 `python3`；用本地接收机还要 `uv`、`librtlsdr`、`readsb`。
+- 离线瓦片不在包里。启动后在菜单「底图 → 选择离线瓦片目录…」里指到放着
+  `planet.pmtiles` 的目录；不选的话离线底图是内置的 Natural Earth 简图。
+- 设置、接收机的运行期状态和 Python 依赖都放在
+  `~/Library/Application Support/Airports`，应用不往自己的包里写这些。
+  例外是 FAA 航图索引：过期后的自动更新仍会改写包里的 `data/faa.js`。
+- 没有开发者签名。在打包的这台机器上可直接打开；拷到别的 Mac 上，系统会因
+  「无法验证开发者」拦一次，右键 → 打开即可。
+
 ## 项目结构
 
 ```
