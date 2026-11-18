@@ -33,3 +33,64 @@
 #sdrAdv .f span{flex:none;color:var(--dim)}
 #sdrAdv select{flex:1;padding:4px 6px}
 #sdrDev{margin-top:6px;color:var(--dim);font-size:11px;line-height:1.5;word-break:break-word}
+
+/* ---------- 话音 ---------- */
+#sdrPill.idle .dot{background:#0e9f6e;opacity:.4}
+#sdrPill .txt{overflow:hidden;text-overflow:ellipsis;min-width:0}
+#sdrPill .back{flex:none;font:inherit;font-size:11px;padding:2px 9px;border:1px solid var(--line);
+               border-radius:10px;background:#fff;color:var(--accent);cursor:pointer}
+#sdrPill .back:hover{border-color:var(--accent)}
+
+/* 指示灯：频率表和频道条用同一个。亮 = 此刻有载波 */
+.sdr-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none;
+         background:#d1d5db;vertical-align:middle;box-sizing:border-box}
+.sdr-dot.on{background:#0e9f6e;box-shadow:0 0 0 3px rgba(14,159,110,.18)}
+.sdr-dot.steady{background:none;border:2px solid #d97706}
+.sdr-dot.far{background:none;border:1.5px dashed #9ca3af}
+
+/* 频率表里多出来的一列 */
+.sdr-th{white-space:nowrap;text-align:right}
+.sdr-td{white-space:nowrap;text-align:right}
+.sdr-listen{font:inherit;font-size:11px;margin-left:6px;padding:2px 9px;border:1px solid var(--line);
+            border-radius:10px;background:#fff;color:var(--accent);cursor:pointer;min-width:44px}
+.sdr-listen:hover{border-color:var(--accent)}
+.sdr-listen.cur{background:var(--accent);border-color:var(--accent);color:#fff}
+.sdr-listen:disabled{color:var(--dim);border-color:transparent;background:none;cursor:default}
+tr.sdr-cur td{background:rgba(37,99,235,.06)}
+
+/* 底部频道条。高度由内容决定，写进 --dock-h，详情面板、地图控件、数据来源那行字都跟着让位 */
+#sdrDock{position:absolute;left:0;right:0;bottom:0;z-index:5;display:none;
+         background:rgba(255,255,255,.97);border-top:1px solid var(--line);
+         box-shadow:0 -2px 12px rgba(16,24,40,.08);font-size:12px;outline:none}
+#sdrDock.on{display:block}
+#sdrDock .hd{display:flex;align-items:center;gap:10px;padding:8px 12px 6px;flex-wrap:wrap}
+#sdrDock .ttl{font-weight:600;white-space:nowrap}
+#sdrDock .now{color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+#sdrDock .now.on{color:#0b7a55}
+#sdrDock .now.warn{color:#b45309}
+#sdrDock .ctl{display:flex;align-items:center;gap:12px;margin-left:auto;flex-wrap:wrap}
+#sdrDock .f{display:flex;align-items:center;gap:6px;color:var(--dim);white-space:nowrap}
+#sdrDock .f input[type=range]{width:86px;margin:0}
+#sdrDock .f .v{min-width:36px;font-variant-numeric:tabular-nums}
+#sdrDock .tog{cursor:pointer;color:inherit}
+#sdrDock .sdr-btn.go{background:var(--accent);border-color:var(--accent);color:#fff}
+#sdrDock .sdr-btn.cur{border-color:#d97706;color:#b45309}
+#sdrDock .wins{display:flex;gap:8px;padding:0 12px 9px;overflow-x:auto}
+#sdrDock .win{flex:none;border:1px solid var(--line);border-radius:8px;padding:5px 7px 6px;background:#fafbfc}
+#sdrDock .win.cur{border-color:var(--accent);background:#fff}
+#sdrDock .wl{display:block;font:inherit;font-size:10.5px;color:var(--dim);border:0;background:none;
+             padding:0 1px 4px;cursor:pointer;font-variant-numeric:tabular-nums}
+#sdrDock .wl:hover{color:var(--accent)}
+#sdrDock .chips{display:flex;gap:5px}
+#sdrDock .chip{display:flex;align-items:center;gap:5px;font:inherit;font-size:11.5px;padding:3px 8px;
+               border:1px solid var(--line);border-radius:12px;background:#fff;color:inherit;
+               cursor:pointer;white-space:nowrap;font-variant-numeric:tabular-nums}
+#sdrDock .chip b{font-weight:600}
+#sdrDock .chip span{color:var(--dim)}
+#sdrDock .chip:hover{border-color:var(--accent)}
+#sdrDock .chip.cur{background:var(--accent);border-color:var(--accent);color:#fff}
+#sdrDock .chip.cur span{color:rgba(255,255,255,.85)}
+#sdrDock .win:not(.cur) .chip{opacity:.7}
+
+/* 地图自带的比例尺和缩放按钮在底边，频道条出来时跟着上移 */
+#wrap .maplibregl-ctrl-bottom-left,#wrap .maplibregl-ctrl-bottom-right{bottom:var(--dock-h,0px)}

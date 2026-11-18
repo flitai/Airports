@@ -52,6 +52,17 @@
   select,input[type=search]{width:100%;padding:6px 8px;border:1px solid var(--line);
         border-radius:6px;background:#fff;font:inherit;color:inherit}
   input[type=range]{width:100%;margin:6px 0 0}
+  /* 飞机填色的图例。渐变的断点与 flights 图层的 icon-color 一一对应 */
+  #altLegend{margin-top:9px}
+  #altLegend .bar{height:8px;border-radius:4px;border:1px solid #111827;
+                  background:linear-gradient(90deg,#ff8a4a 0%,#ffd166 25%,#7fd4ff 62.5%,#c3b5ff 100%)}
+  #altLegend .tk{position:relative;height:15px;margin-top:3px;font-size:10.5px;color:var(--dim);
+                 font-variant-numeric:tabular-nums}
+  #altLegend .tk span{position:absolute;top:0;white-space:nowrap;transform:translateX(-50%)}
+  #altLegend .tk span:first-child{left:0;transform:none}
+  #altLegend .tk span:nth-child(2){left:25%}
+  #altLegend .tk span:nth-child(3){left:62.5%}
+  #altLegend .tk span:last-child{left:auto;right:0;transform:none}
   #count{padding:9px 16px;border-top:1px solid var(--line);background:#fff;
          font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
   #count b{color:var(--ink)}
@@ -74,13 +85,13 @@
        transform:translate(-50%,-165%)}
   #boot{position:absolute;inset:0;z-index:9;background:#eef1f5;display:flex;
         align-items:center;justify-content:center;color:var(--dim);font-size:13px}
-  #note{position:absolute;left:12px;bottom:8px;z-index:4;font-size:11px;color:var(--dim);
+  #note{position:absolute;left:12px;bottom:calc(8px + var(--dock-h,0px));z-index:4;font-size:11px;color:var(--dim);
         background:rgba(255,255,255,.86);padding:3px 8px;border-radius:5px}
   #note a{color:var(--dim)}
   #baseAttrib a{color:var(--dim)}
 
   /* ---------- 右侧详情 ---------- */
-  #detail{position:absolute;top:0;right:0;bottom:0;width:370px;background:#fff;
+  #detail{position:absolute;top:0;right:0;bottom:var(--dock-h,0px);width:370px;background:#fff;
           border-left:1px solid var(--line);box-shadow:var(--shadow);z-index:6;
           transform:translateX(100%);transition:transform .18s ease;
           display:flex;flex-direction:column}
@@ -143,7 +154,7 @@
       <label class="row"><input type="checkbox" id="fClosed"><span class="n">显示已关闭机场</span>
         <span class="c" id="closedNote"></span></label>
     </div>
-    <div class="grp"><label class="t">最长跑道 ≥ <span id="lenTxt">0 ft</span></label>
+    <div class="grp"><label class="t">最长跑道 ≥ <span id="lenTxt">0</span></label>
       <input type="range" id="fLen" min="0" max="16000" step="500" value="0">
     </div>
     <div class="grp"><label class="t">国家 / 地区</label>
@@ -152,7 +163,7 @@
     <div class="grp"><label class="t">底图</label>
       <select id="fBase">
         <option value="auto">自动</option>
-        <option value="offline">离线</option>
+        <option value="offline" selected>离线</option>
         <option value="online">在线</option>
       </select>
       <label class="row" style="margin-top:7px"><input type="checkbox" id="fHill">
@@ -164,7 +175,19 @@
     <div class="grp"><label class="t">实时航班</label>
       <label class="row"><input type="checkbox" id="fFlights">
         <span class="n">显示空中航班</span><span class="c" id="flightCount"></span></label>
+      <label class="row" style="margin-top:7px"><input type="checkbox" id="fTrails" checked>
+        <span class="n">显示尾迹</span></label>
+      <div id="altLegend" title="飞机的填色表示气压高度">
+        <div class="bar"></div>
+        <div class="tk"><span></span><span></span><span></span><span></span></div>
+      </div>
       <div class="hint" id="flightHint"></div>
+    </div>
+    <div class="grp"><label class="t">单位</label>
+      <select id="fUnits">
+        <option value="metric">公制</option>
+        <option value="imperial">英制</option>
+      </select>
     </div>
   </div>
   <div id="count"></div>
@@ -181,6 +204,7 @@
   <div id="note">数据 <a href="https://ourairports.com/" target="_blank" rel="noopener">OurAirports</a>
     · 底图 <span id="baseAttrib"></span></div>
 
+  <div id="sdrMount"></div>
   <section id="detail">
     <div id="dhead"><h2 id="dName"></h2><div class="sub" id="dSub"></div>
       <button id="close" title="关闭">✕</button></div>
@@ -239,7 +263,20 @@ function el(tag, cls, text){
   return n;
 }
 function fmt(n){ return n==null ? "—" : String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
-function ftm(ft){ return ft==null ? "—" : fmt(ft)+" ft / "+fmt(Math.round(ft*0.3048))+" m"; }
+// ---------- 单位 ----------
+// 数据一律按航空惯用的英制存和算（海里、英尺、节），只在显示的那一刻换算。
+// 公制：km、m、km/h；英制：nm、ft、kt。默认公制，选择记在浏览器里。
+var metric = true;
+try { metric = localStorage.getItem("ap.units") !== "imperial"; } catch (e) {}
+var U = {
+  metric:function(){ return metric; },
+  dist:function(nm){ return metric ? fmt(Math.round(nm * 1.852)) + " km" : fmt(Math.round(nm)) + " nm"; },
+  alt:function(ft){ return metric ? fmt(Math.round(ft * 0.3048)) + " m" : fmt(Math.round(ft)) + " ft"; },
+  speed:function(kt){ return metric ? fmt(Math.round(kt * 1.852)) + " km/h" : Math.round(kt) + " kt"; },
+  len:function(ft){ return fmt(Math.round(metric ? ft * 0.3048 : ft)); },     // 不带单位，表格里用
+  lenUnit:function(){ return metric ? "m" : "ft"; }
+};
+function ftm(ft){ return ft==null ? "—" : U.alt(ft); }
 function ctyName(i){ return M.ctyNames[i] || M.ctyCodes[i] || "—"; }
 function rgnName(i){ return M.rgnNames[i] || M.rgnCodes[i] || "—"; }
 
@@ -345,6 +382,9 @@ var bound = {};
 var hooks = { styleReady:[],        // 样式重建后要重挂的图层
               clickLayers:[],       // 点在这些图层上不算「点了空白」
               flightDetail:null,    // function(kv, hex)：往航班详情里追加几行
+              units:null,           // function()：公制 / 英制切换了，扩展里带单位的地方该重画
+              freqRow:null,         // function(tr, fq, i, ap)：频率表每建好一行调一次；ap = {id, label, list}
+              detail:null,          // function(id | null)：详情面板换成了哪个机场，或不再显示机场
               esc:null };           // function() -> true 表示这次 Esc 已被扩展用掉
 function bindLayer(layer){
   if (bound[layer]) return;
@@ -438,6 +478,8 @@ function toggleClosed(on){
 // 关岛这些属地，以及密克罗尼西亚、马绍尔、帕劳这三个自由联合邦——硬编码辖区
 // 清单迟早会漏，索引本身才是权威。
 var faa = null, faaLoading = false, faaQueue = [], curDetail = null;
+var shownAirport = null;             // 详情面板此刻显示的机场；显示航班或已关闭时为 null
+var shownFlight = null;              // 详情面板此刻显示的航班（要素属性）；换单位时拿它重画
 
 function faaUrl(pdf){ return "https://aeronav.faa.gov/d-tpp/" + faa.cycle + "/" + pdf + ".PDF"; }
 // FAA 只把最近三个周期留在服务器上，过期的会 404，所以到期要提示用户重跑构建脚本
@@ -561,11 +603,11 @@ function showDetail(id){
   // 跑道
   if (d.r && d.r.length){
     var t = el("table");
-    t.append(trh(["跑道","长 × 宽 (ft)","道面","灯光"]));
+    t.append(trh(["跑道","长 × 宽 (" + U.lenUnit() + ")","道面","灯光"]));
     d.r.forEach(function(rw){
       var tr = el("tr");
       var name = (rw[0]||"?") + "/" + (rw[1]||"?") + (rw[7] ? " (已关闭)" : "");
-      var size = (rw[2]==null?"—":fmt(rw[2])) + " × " + (rw[3]==null?"—":fmt(rw[3]));
+      var size = (rw[2]==null?"—":U.len(rw[2])) + " × " + (rw[3]==null?"—":U.len(rw[3]));
       var surf = M.surfaceZh[M.surfaces[rw[4]]];
       if (rw[5] && rw[5].toUpperCase() !== M.surfaces[rw[4]].toUpperCase()) surf += "（" + rw[5] + "）";
       tr.append(el("td",null,name), el("td","n",size), el("td",null,surf), el("td",null, rw[6]?"有":"—"));
@@ -581,10 +623,12 @@ function showDetail(id){
   if (d.f && d.f.length){
     var tf = el("table");
     tf.append(trh(["类型","说明","频率 (MHz)"]));
-    d.f.forEach(function(fq){
+    var apInfo = { id:id, label:r[IDENT] + " " + r[NAME], list:d.f };
+    d.f.forEach(function(fq, i){
       var tr = el("tr");
       tr.append(el("td",null,fq[0]||"—"), el("td",null,fq[1]||"—"), el("td","n",fq[2]||"—"));
       tf.append(tr);
+      if (hooks.freqRow) hooks.freqRow(tr, fq, i, apInfo);
     });
     body.append(sect("通信频率 · " + d.f.length + " 条", tf));
   } else {
@@ -606,6 +650,8 @@ function showDetail(id){
   body.append(sect("航图", cbox));
 
   document.getElementById("detail").classList.add("on");
+  shownAirport = id; shownFlight = null;
+  if (hooks.detail) hooks.detail(id);
 }
 function sect(title, node){
   var s = el("section","sec"); s.append(el("h3",null,title), node); return s;
@@ -619,6 +665,8 @@ function link(text, href){
 function hideDetail(){
   document.getElementById("detail").classList.remove("on");
   clearRoute();
+  shownAirport = null; shownFlight = null;
+  if (hooks.detail) hooks.detail(null);
 }
 
 // ---------- 搜索 ----------
@@ -694,12 +742,17 @@ document.addEventListener("click", function(e){
   document.getElementById("fClosed").addEventListener("change", function(){
     toggleClosed(this.checked); });
 
-  var len = document.getElementById("fLen"), lenTxt = document.getElementById("lenTxt");
+  var len = document.getElementById("fLen");
   len.addEventListener("input", function(){
     F.len = +len.value;
-    lenTxt.textContent = F.len ? fmt(F.len)+" ft" : "0 ft";
+    lenLabel();
     refresh();
   });
+  lenLabel();
+
+  var units = document.getElementById("fUnits");
+  units.value = metric ? "metric" : "imperial";
+  units.addEventListener("change", function(){ setUnits(units.value); });
 
   // 国家下拉：只列出实际有机场的，按机场数降序
   var used = {};
@@ -713,6 +766,26 @@ document.addEventListener("click", function(e){
     });
   sel.addEventListener("change", function(){ F.cty = +sel.value; refresh(); });
 })();
+
+function lenLabel(){
+  document.getElementById("lenTxt").textContent = U.len(F.len) + " " + U.lenUnit();
+  // 高度图例的刻度：与 flights 图层 icon-color 的四个断点相同
+  var tk = document.querySelectorAll("#altLegend .tk span"), at = [0, 10000, 25000, 40000];
+  for (var i=0;i<tk.length;i++) tk[i].textContent = i ? U.alt(at[i]) : "地面";
+}
+
+// 换单位：把屏幕上所有带单位的地方重画一遍。详情面板是一次性画好的，所以整个重开。
+function setUnits(which){
+  metric = which !== "imperial";
+  document.getElementById("fUnits").value = metric ? "metric" : "imperial";
+  try { localStorage.setItem("ap.units", metric ? "metric" : "imperial"); } catch (e) {}
+  lenLabel();
+  if (document.getElementById("detail").classList.contains("on")){
+    if (shownAirport != null) showDetail(shownAirport);
+    else if (shownFlight) showFlightDetail(shownFlight);
+  }
+  if (hooks.units) hooks.units();
+}
 
 document.getElementById("close").addEventListener("click", hideDetail);
 document.getElementById("chartClose").addEventListener("click", closeChart);
@@ -1107,7 +1180,9 @@ function protomapsStyle(url, maxzoom){
 var PMTILES_CANDIDATES = ["tiles/planet.pmtiles", "tiles/global-z9.pmtiles",
                           "tiles/test-yrd.pmtiles"];   // 按顺序探测，用第一个存在的
 var pmUrl = null, demOk = false;
-var baseMode = "auto", onlineTimer = null, curHint = "", curAttrib = "ne";
+// 默认离线：本地有街道级瓦片就用它，没有就用内嵌的 Natural Earth。这样打开页面
+// 不依赖外网，也不会先向在线底图发请求。想要在线底图在下拉框里选。
+var baseMode = "offline", onlineTimer = null, curHint = "", curAttrib = "ne";
 // 3D 建筑：bldg3dHidden 记录被 3D 层顶替而临时隐藏的 2D 建筑层，关闭时逐个恢复；
 // styleGen 每次重挂样式自增，用来作废上一份样式遗留的异步探测回调（map 级监听
 // 不随 setStyle 清除，回调晚到时可能对着新样式乱动）。
@@ -1187,13 +1262,18 @@ var activeMode = "ne";
 
 // 离线一档内部按 PMTILES_CANDIDATES 的预排顺序回落：detectAssets 已经按那个顺序
 // 探过，pmUrl 就是第一个存在的包；一个都没有才退到 Natural Earth。
-function offlineStack(why){
-  if (pmUrl) useStyle("pmtiles", why + "本地街道级底图 · " + pmUrl.replace(/^tiles\//, ""));
+function offlinePick(why){
+  // → [样式名, 提示语]。本地有街道级瓦片就用，没有退到 Natural Earth
+  if (pmUrl) return ["pmtiles", why + "本地街道级底图 · " + pmUrl.replace(/^tiles\//, "")];
   // file:// 下 probe() 直接返回 false，pmUrl 必然为空——这跟「文件真的不在」是两回事，
   // 提示要说清楚，否则用户会以为自己下的瓦片丢了
-  else if (location.protocol === "file:")
-    useStyle("ne", why + "file:// 无法探测本地瓦片，用 Natural Earth（改用 start.command 启动可读 PMTiles）");
-  else useStyle("ne", why + "未找到 tiles/*.pmtiles，用 Natural Earth");
+  if (location.protocol === "file:")
+    return ["ne", why + "file:// 无法探测本地瓦片，用 Natural Earth（改用 start.command 启动可读 PMTiles）"];
+  return ["ne", why + "未找到 tiles/*.pmtiles，用 Natural Earth"];
+}
+function offlineStack(why){
+  var pick = offlinePick(why);
+  useStyle(pick[0], pick[1]);
 }
 
 // 自动 = 有网走在线，没网读本地。navigator.onLine 只能确诊「网卡断了」，它为 true
@@ -1420,16 +1500,19 @@ function flightsSupported(){ return location.protocol !== "file:"; }
 //                           联网数据给过一次就留着，别被本地的空值冲掉
 // 每个来源每次交来的都是完整快照：这次没出现的飞机，就不再算它的。一架飞机
 // 所有来源都不要了才从表里删。
-var AC = Object.create(null);    // ICAO24 -> { hex, cs, reg, ty, by:{ 来源:{lat,lon,alt,gs,tr,t,g,x} }, trail }
+var AC = Object.create(null);    // ICAO24 -> { hex, cs, reg, ty, by:{ 来源:{lat,lon,alt,gs,tr,t,g,x} }, trail:[[lon,lat,t],…] }
 var acGen = {};                  // 来源 -> 最近一次快照的代号，用来认出「这次没出现」
 var acTimer = null, acLast = 0;
 var AC_RENDER_MS = 1000;         // 出图节流：本地数据每秒一报，再快也没有新位置可画
-var AC_TRAIL_MAX = 240;          // 每架最多留这么多个航迹点，每秒一点就是 4 分钟
+// 尾迹：每架飞机身后拖一小段，越往后越淡。它是「刚才从哪儿来」的提示，不是完整航迹。
+var AC_TRAIL_S = 150;            // 只留最近这么多秒
+var AC_TRAIL_GAP_S = 3;          // 历史点至少隔这么久记一个。本地数据每秒一报，位置里带着
+                                 // 解码的量化抖动，逐点连起来是锯齿；抽稀后再用样条连才顺
+var AC_TRAIL_BREAK_S = 45;       // 两个点隔了这么久（丢了一阵信号）就另起一段，不硬连
 var acVis = {};                  // 来源 -> 是否要求显示；任何一个来源要显示，图层就得开着
+var trailsOn = true;             // 侧栏「显示尾迹」。只管画不画，历史点照常攒着，重新打开立刻就有
 
-function acIngest(src, list, trail){
-  // trail=true 的来源顺带攒航迹。只有更新够密的来源才值得画：联网数据 10 秒
-  // 一个点，连起来是折线不是航迹。
+function acIngest(src, list){
   var g = acGen[src] = (acGen[src] || 0) + 1, i, h, r;
   for (i=0;i<list.length;i++){
     var a = list[i];
@@ -1440,42 +1523,103 @@ function acIngest(src, list, trail){
     if (a.ty)  r.ty  = a.ty;
     // x 是来源自带的附加信息（比如本地接收的信号强度），状态表不解读，原样留给详情面板
     r.by[src] = { lat:a.lat, lon:a.lon, alt:a.alt, gs:a.gs, tr:a.tr, t:a.t || 0, g:g, x:a.x };
-    if (trail){
-      var tr = r.trail || (r.trail = { src:src, pts:[] }), last = tr.pts[tr.pts.length-1];
-      if (!last || last[0] !== a.lon || last[1] !== a.lat){
-        tr.pts.push([a.lon, a.lat]);
-        if (tr.pts.length > AC_TRAIL_MAX) tr.pts.shift();
-      }
-    }
   }
   for (h in AC){
     r = AC[h];
     if (r.by[src] && r.by[src].g !== g){
       delete r.by[src];
-      // 航迹跟着攒它的来源走：那个来源不再报这架了，线就该断，不然会拖着一条
-      // 不再生长的尾巴，和飞机图标越离越远
-      if (r.trail && r.trail.src === src) delete r.trail;
       var left = false;
       for (var s in r.by){ left = true; break; }
       if (!left) delete AC[h];
     }
   }
+  acTrack();
+}
+
+// 给每架飞机的尾迹记一个历史点。记的是「当前最可信的位置」（acBest），不分来源：
+// 本地和联网两边都有的飞机只有一条尾迹，一边断了另一边接着长。
+function acTrack(){
+  var now = Date.now() / 1000;
+  for (var h in AC){
+    var r = AC[h], b = acBest(r);
+    if (!b || b.k.lat == null) continue;
+    var t = b.k.t || now, tr = r.trail || (r.trail = []), last = tr[tr.length - 1];
+    if (last){
+      var dt = t - last[2];
+      // 时间倒退（换到了位置更旧的来源）不记；隔太久或者跳得离谱（跨了日界线、
+      // 地址被别的飞机复用）就从头来，免得横穿地图画一条直线
+      if (dt > AC_TRAIL_BREAK_S || Math.abs(b.k.lon - last[0]) > 2 || Math.abs(b.k.lat - last[1]) > 2){
+        tr.length = 0; last = null;
+      } else if (dt < AC_TRAIL_GAP_S) continue;
+    }
+    if (!last || last[0] !== b.k.lon || last[1] !== b.k.lat) tr.push([b.k.lon, b.k.lat, t]);
+  }
 }
 
 function acShow(src, on){
   acVis[src] = !!on;
-  var v = acVisible() ? "visible" : "none";
-  if (map && map.getLayer("flights"))       map.setLayoutProperty("flights", "visibility", v);
-  if (map && map.getLayer("flight-trails")) map.setLayoutProperty("flight-trails", "visibility", v);
+  acApplyVis();
+}
+function trailVis(){ return acVisible() && trailsOn ? "visible" : "none"; }
+function acApplyVis(){
+  if (!map) return;
+  if (map.getLayer("flights")) map.setLayoutProperty("flights", "visibility", acVisible() ? "visible" : "none");
+  ["flight-trails", "flight-trails-local"].forEach(function(l){
+    if (map.getLayer(l)) map.setLayoutProperty(l, "visibility", trailVis());
+  });
+}
+function setTrails(on){
+  trailsOn = !!on;
+  document.getElementById("fTrails").checked = trailsOn;
+  try { localStorage.setItem("ap.trails", trailsOn ? "1" : "0"); } catch (e) {}   // 记不住也无妨
+  acApplyVis();
 }
 function acVisible(){ for (var s in acVis) if (acVis[s]) return true; return false; }
 
+// 过一串点的平滑曲线（按弦长参数化的 Catmull-Rom 样条）。点与点的间隔很不均匀——
+// 联网数据 10 秒一个点，本地数据抽稀后 3 秒一个，最后一段是到飞机当前位置的零头——
+// 按弦长取切线，长短段相接处才不会甩出一个小圈。
+function smoothLine(p){
+  if (p.length < 3) return p;
+  var k = Math.cos(p[0][1] * Math.PI / 180) || 1e-6;      // 经度按纬度缩一下，距离才是各向同性的
+  var q = p.map(function(c){ return [c[0] * k, c[1]]; }), n = q.length, v = [], i, out = [];
+  function dist(a, b){ return Math.hypot(b[0] - a[0], b[1] - a[1]) || 1e-12; }
+  for (i=0;i<n;i++){                                       // 每个点上的速度方向（单位弦长）
+    var a = q[i-1], c = q[i], d = q[i+1];
+    if (!a)      v.push([(d[0]-c[0]) / dist(c,d), (d[1]-c[1]) / dist(c,d)]);
+    else if (!d) v.push([(c[0]-a[0]) / dist(a,c), (c[1]-a[1]) / dist(a,c)]);
+    else {
+      var d1 = dist(a,c), d2 = dist(c,d);
+      v.push([((c[0]-a[0]) / d1 * d2 + (d[0]-c[0]) / d2 * d1) / (d1 + d2),
+              ((c[1]-a[1]) / d1 * d2 + (d[1]-c[1]) / d2 * d1) / (d1 + d2)]);
+    }
+  }
+  for (i=0;i<n-1;i++){
+    var p1 = q[i], p2 = q[i+1], len = dist(p1, p2);
+    for (var j=0;j<6;j++){                                 // 每段切 6 小段，埃尔米特插值
+      var u = j / 6, u2 = u * u, u3 = u2 * u;
+      var h1 = 2*u3 - 3*u2 + 1, h2 = u3 - 2*u2 + u, h3 = -2*u3 + 3*u2, h4 = u3 - u2;
+      out.push([+((h1*p1[0] + h2*len*v[i][0] + h3*p2[0] + h4*len*v[i+1][0]) / k).toFixed(5),
+                +(h1*p1[1] + h2*len*v[i][1] + h3*p2[1] + h4*len*v[i+1][1]).toFixed(5)]);
+    }
+  }
+  out.push(p[n-1].slice(0, 2));
+  return out;
+}
+
 function acTrails(){
-  var f = [];
+  var f = [], old = Date.now() / 1000 - AC_TRAIL_S;
   for (var h in AC){
-    var tr = AC[h].trail;
-    if (tr && tr.pts.length > 1)
-      f.push({ type:"Feature", geometry:{ type:"LineString", coordinates:tr.pts }, properties:{} });
+    var r = AC[h], tr = r.trail, b = acBest(r);
+    if (!tr || !b) continue;
+    while (tr.length && tr[0][2] < old) tr.shift();        // 过时的点在这里清掉，尾巴随之变短
+    if (!tr.length) continue;
+    // 尾迹的头必须正好接在图标上：历史点是抽稀过的，最后一个可能落后飞机一两秒
+    var pts = tr.slice(), last = pts[pts.length - 1];
+    if (last[0] !== b.k.lon || last[1] !== b.k.lat) pts.push([b.k.lon, b.k.lat]);
+    if (pts.length < 2) continue;
+    f.push({ type:"Feature", geometry:{ type:"LineString", coordinates:smoothLine(pts) },
+             properties:{ src:b.src } });
   }
   return { type:"FeatureCollection", features:f };
 }
@@ -1517,22 +1661,36 @@ function acRender(now){
   acLast = Date.now();
   if (map && map.getSource("flights")) map.getSource("flights").setData(acCollection());
   if (map && map.getSource("flight-trails")) map.getSource("flight-trails").setData(acTrails());
+  paintRoute();                                 // 选中的那架动了，航线的折点跟着它走
 }
 
 function planeIcon(){
   // 运行时画图标，而不是用 "✈" 这类字符：vendor/glyphs.js 只内嵌了拉丁 0-255，
   // U+2708 不在里面，离线字形服务器根本给不出这个字。
-  var n = 24, c = document.createElement("canvas");
-  c.width = c.height = n;
-  var x = c.getContext("2d");
-  x.fillStyle = "#fff";
-  x.beginPath();
-  x.moveTo(12,1); x.lineTo(14.6,10); x.lineTo(23,15.4); x.lineTo(23,17.6);
-  x.lineTo(13.7,14.9); x.lineTo(13.2,19.6); x.lineTo(16.6,22); x.lineTo(16.6,23.4);
-  x.lineTo(12,22.2); x.lineTo(7.4,23.4); x.lineTo(7.4,22); x.lineTo(10.8,19.6);
-  x.lineTo(10.3,14.9); x.lineTo(1,17.6); x.lineTo(1,15.4); x.lineTo(9.4,10);
-  x.closePath(); x.fill();
-  return { width:n, height:n, data:new Uint8Array(x.getImageData(0,0,n,n).data) };
+  //
+  // 画的是「距离场」而不是一张黑白蒙版：每个像素存的是它到飞机轮廓的距离。
+  // MapLibre 的图标描边（icon-halo）靠的就是这个——它把距离在某个范围内的像素
+  // 涂成描边色。以前这里直接 fill 一个多边形，像素非黑即白，没有距离可言，
+  // 样式里写的描边实际上一个像素都画不出来，浅色的飞机就淹在浅色底图里。
+  // 约定（与 MapLibre 的着色器一致）：轮廓处 alpha = 0.75，每往外 1 像素减 1/8。
+  var P = [[12,1],[14.6,10],[23,15.4],[23,17.6],[13.7,14.9],[13.2,19.6],[16.6,22],[16.6,23.4],
+           [12,22.2],[7.4,23.4],[7.4,22],[10.8,19.6],[10.3,14.9],[1,17.6],[1,15.4],[9.4,10]];
+  var pad = 6, n = 24 + 2 * pad, data = new Uint8Array(n * n * 4);
+  for (var y=0;y<n;y++) for (var x=0;x<n;x++){
+    var px = x + .5 - pad, py = y + .5 - pad, best = 1e9, inside = false;
+    for (var i=0, j=P.length-1; i<P.length; j=i++){
+      var ax = P[j][0], ay = P[j][1], bx = P[i][0], by = P[i][1];
+      var dx = bx - ax, dy = by - ay;
+      var t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)));
+      var ex = px - ax - t * dx, ey = py - ay - t * dy;
+      best = Math.min(best, ex * ex + ey * ey);
+      if ((ay > py) !== (by > py) && px < ax + (py - ay) * dx / dy) inside = !inside;   // 射线法
+    }
+    var d = Math.sqrt(best) * (inside ? -1 : 1), o = (y * n + x) * 4;
+    data[o] = data[o+1] = data[o+2] = 255;
+    data[o+3] = Math.round(255 * Math.max(0, Math.min(1, .75 - d / 8)));
+  }
+  return { width:n, height:n, data:data };
 }
 
 function addFlightLayer(){
@@ -1540,10 +1698,18 @@ function addFlightLayer(){
   if (map.getSource("flights")) return;
   // 直接用状态表里现有的飞机建源：切换底图会销毁图层，以前要等下一次轮询
   // （最多 10 秒）飞机才回来，现在重挂的同时就画上了
-  map.addSource("flight-trails", { type:"geojson", data:acTrails() });
-  map.addLayer({ id:"flight-trails", type:"line", source:"flight-trails",
-    layout:{ "visibility": acVisible() ? "visible" : "none", "line-cap":"round", "line-join":"round" },
-    paint:{ "line-color":"#0e9f6e", "line-width":1.6, "line-opacity":.75 } });
+  // lineMetrics 打开后才有 line-progress（0 = 线的起点即最旧的点，1 = 飞机所在处），
+  // 尾迹靠它从透明渐变到实色。渐变色不能按要素取值，所以本地和联网各用一个图层。
+  map.addSource("flight-trails", { type:"geojson", data:acTrails(), lineMetrics:true });
+  [["flight-trails", ["!=",["get","src"],"local"], "17,24,39", .62],
+   ["flight-trails-local", ["==",["get","src"],"local"], "22,163,74", .9]].forEach(function(d){
+    map.addLayer({ id:d[0], type:"line", source:"flight-trails", filter:d[1],
+      layout:{ "visibility": trailVis(), "line-cap":"round", "line-join":"round" },
+      paint:{ "line-width":["interpolate",["linear"],["zoom"], 3,1.2, 8,2.2, 12,3],
+              "line-gradient":["interpolate",["linear"],["line-progress"],
+                               0,"rgba(" + d[2] + ",0)", .35,"rgba(" + d[2] + "," + (d[3] * .35) + ")",
+                               1,"rgba(" + d[2] + "," + d[3] + ")"] } });
+  });
   map.addSource("flights", { type:"geojson", data:acCollection() });
   map.addLayer({
     id:"flights", type:"symbol", source:"flights",
@@ -1555,9 +1721,10 @@ function addFlightLayer(){
     // 按气压高度着色：低空暖、高空冷，一眼能分出进近的和巡航的
     paint:{ "icon-color":["interpolate",["linear"],["coalesce",["get","alt"],0],
               0,"#ff8a4a", 10000,"#ffd166", 25000,"#7fd4ff", 40000,"#c3b5ff"],
-            // 自己天线收到的飞机套一圈绿边，和联网数据一眼分得开；填色仍然表示高度
-            "icon-halo-color":["case",["==",["get","src"],"local"],"#0e9f6e","rgba(8,12,18,.85)"],
-            "icon-halo-width":["case",["==",["get","src"],"local"],2,1.1] }
+            // 描边：填色是偏浅的，没有这一圈在浅色底图上看不清。联网数据描深色边；
+            // 自己天线收到的描一圈更宽的鲜绿边，一眼就能认出来。填色仍然表示高度
+            "icon-halo-color":["case",["==",["get","src"],"local"],"#16a34a","#111827"],
+            "icon-halo-width":["case",["==",["get","src"],"local"],2.4,1.3] }
   });
   bindFlightTip();
 }
@@ -1572,8 +1739,8 @@ function bindFlightTip(){
     if (p.cs)  bits.push(p.cs);
     if (p.ty)  bits.push(p.ty);
     if (p.reg) bits.push(p.reg);
-    if (p.alt != null && p.alt !== "") bits.push(fmt(+p.alt) + " ft");
-    if (p.gs  != null && p.gs  !== "") bits.push(Math.round(+p.gs) + " kt");
+    if (p.alt != null && p.alt !== "") bits.push(U.alt(+p.alt));
+    if (p.gs  != null && p.gs  !== "") bits.push(U.speed(+p.gs));
     tip.textContent = bits.join("  ·  ") || p.hex;
     tip.style.display = "block";
     tip.style.left = e.point.x + "px";
@@ -1625,7 +1792,7 @@ function pollFlights(){
       // 覆盖情况要说实话：上游单次查询半径上限 250 nm，视口再大就只能盖住中心
       var cov = res.j.covered
         ? (res.j.tiles > 1 ? "已覆盖视口（" + res.j.tiles + " 片合并）" : "已覆盖视口")
-        : "⚠ 视口过大，只覆盖中心 " + FL_MAX_NM + " nm，放大可看全";
+        : "⚠ 视口过大，只覆盖中心 " + U.dist(FL_MAX_NM) + "，放大可看全";
       flightHint(res.j.src + " · " + new Date().toLocaleTimeString() + " · " + cov);
     })
     .catch(function(e){
@@ -1660,9 +1827,12 @@ function setFlights(on){
 }
 
 function initFlightsUI(){
-  var cb = document.getElementById("fFlights");
+  var cb = document.getElementById("fFlights"), tr = document.getElementById("fTrails");
+  try { if (localStorage.getItem("ap.trails") === "0") trailsOn = false; } catch (e) {}
+  tr.checked = trailsOn;
+  tr.addEventListener("change", function(){ setTrails(tr.checked); });
   if (!flightsSupported()){
-    cb.disabled = true;
+    cb.disabled = tr.disabled = true;
     flightHint("file:// 模式不可用：数据源不发 CORS 头，必须经 serve.py 代理。" +
                "请改用 start.command / start.bat 启动。");
     return;
@@ -1763,8 +1933,14 @@ function addRouteLayer(){
   if (map.getSource("route")) return;
   map.addSource("route", { type:"geojson", data:FL_EMPTY });
   var before = map.getLayer("flights") ? "flights" : undefined;   // 航线压在飞机下面
+  // 两段：已经飞过的（起点 → 飞机）画实线，还没飞的（飞机 → 终点）画虚线。
+  // 虚线样式不能按要素取值，所以分两个图层。
+  map.addLayer({ id:"route-flown", type:"line", source:"route",
+    filter:["==",["get","k"],"flown"],
+    layout:{ "line-cap":"round", "line-join":"round" },
+    paint:{ "line-color":"#4ea3ff", "line-width":2.4, "line-opacity":.9 } }, before);
   map.addLayer({ id:"route-line", type:"line", source:"route",
-    filter:["==","$type","LineString"],
+    filter:["==",["get","k"],"togo"],
     layout:{ "line-cap":"round", "line-join":"round" },
     paint:{ "line-color":"#4ea3ff", "line-width":2.2, "line-opacity":.9,
             "line-dasharray":[2,1.6] } }, before);
@@ -1772,25 +1948,49 @@ function addRouteLayer(){
     filter:["==","$type","Point"],
     paint:{ "circle-radius":5, "circle-color":"#4ea3ff",
             "circle-stroke-width":2, "circle-stroke-color":"rgba(8,12,18,.85)" } }, before);
+  paintRoute();                                 // 切底图重挂图层时，正显示着的航线接着画
 }
+
+var routeCtx = null;                            // 正显示着的航线：{ from, to, hex }
 
 function clearRoute(){
   routeSeq++;                                   // 作废在途的航线请求
-  routeN = 0;
+  routeN = 0; routeCtx = null;
   if (map && map.getSource("route")) map.getSource("route").setData(FL_EMPTY);
 }
 
-function drawRoute(from, to){
-  if (!map.getSource("route")) return;
-  routeN = 3;
-  map.getSource("route").setData({ type:"FeatureCollection", features:[
-    { type:"Feature", geometry:{ type:"LineString",
-        coordinates:greatCircle([from.lon,from.lat],[to.lon,to.lat],96) }, properties:{} },
-    { type:"Feature", geometry:{ type:"Point", coordinates:[from.lon,from.lat] },
-      properties:{} },
-    { type:"Feature", geometry:{ type:"Point", coordinates:[to.lon,to.lat] },
-      properties:{} }
-  ]});
+function drawRoute(from, to, hex){
+  routeCtx = { from:from, to:to, hex:hex };
+  paintRoute();
+}
+
+// 航线画成「起点 → 飞机 → 终点」两段大圆，而不是起点直连终点：飞机很少正好压在
+// 两地之间的大圆上，直连的那条线和飞机对不上。两段各自是大圆，飞机每动一次重画一次。
+// 飞机的位置拿不到了（飞出视野、信号丢了）就退回起点直连终点。
+function paintRoute(){
+  if (!routeCtx || !map || !map.getSource("route")) return;
+  var a = [routeCtx.from.lon, routeCtx.from.lat], b = [routeCtx.to.lon, routeCtx.to.lat];
+  var pos = curFlightPos(routeCtx.hex), f = [];
+  function line(k, pts){ f.push({ type:"Feature", geometry:{ type:"LineString", coordinates:pts }, properties:{ k:k } }); }
+  var togo;
+  if (pos){
+    var flown = greatCircle(a, pos, 64);
+    togo = greatCircle(pos, b, 64);
+    // greatCircle 为了跨 180° 经线不断线，会把经度接着往外数（比如 181°）。第二段要从
+    // 第一段停下的那个经度接着画，否则跨日界线的航线两段会落在两份世界地图上
+    var shift = Math.round((flown[flown.length-1][0] - togo[0][0]) / 360) * 360;
+    if (shift) togo = togo.map(function(c){ return [c[0] + shift, c[1]]; });
+    line("flown", flown);
+    a = flown[0];
+  } else {
+    togo = greatCircle(a, b, 96);
+    a = togo[0];
+  }
+  line("togo", togo);
+  f.push({ type:"Feature", geometry:{ type:"Point", coordinates:a }, properties:{} },
+         { type:"Feature", geometry:{ type:"Point", coordinates:togo[togo.length-1] }, properties:{} });
+  routeN = f.length;
+  map.getSource("route").setData({ type:"FeatureCollection", features:f });
 }
 
 function resolveEnd(e){
@@ -1807,6 +2007,8 @@ function resolveEnd(e){
 
 function showFlightDetail(p){
   clearRoute();
+  shownAirport = null; shownFlight = p;
+  if (hooks.detail) hooks.detail(null);
   var seq = ++routeSeq;
   var box = document.getElementById("detail");
   document.getElementById("dName").textContent = p.cs || p.hex || "未知航班";
@@ -1820,7 +2022,7 @@ function showFlightDetail(p){
   var dl = el("dl");
   function kv(k,v){ dl.append(el("dt",null,k), el("dd",null,v)); }
   kv("气压高度", (p.alt==null||p.alt==="") ? "—" : ftm(+p.alt));
-  kv("地速",     (p.gs ==null||p.gs ==="") ? "—" : Math.round(+p.gs)+" kt");
+  kv("地速",     (p.gs ==null||p.gs ==="") ? "—" : U.speed(+p.gs));
   kv("航向",     (p.tr ==null||p.tr ==="") ? "—" : Math.round(+p.tr)+"°");
   kv("ICAO24",   p.hex || "—");
   if (hooks.flightDetail) hooks.flightDetail(kv, p.hex);
@@ -1866,18 +2068,20 @@ function showFlightDetail(p){
       });
       rbox.append(line);
 
-      drawRoute(A, B);
+      drawRoute(A, B, p.hex);
 
       // 拿实际位置校验：ADS-B 的位置是真的，查表来的航线不一定是
       var gc = nmBetween([A.lon,A.lat],[B.lon,B.lat]);
-      var info = "大圆距离 " + fmt(Math.round(gc)) + " nm · 来源 " + (j.src||"—");
-      rbox.append(el("div","hint", info));
       var pos = curFlightPos(p.hex);
+      var info = "大圆距离 " + U.dist(gc);
+      if (pos) info += " · 已飞 " + U.dist(nmBetween([A.lon,A.lat], pos)) +
+                       " · 剩余 " + U.dist(nmBetween(pos, [B.lon,B.lat]));
+      rbox.append(el("div","hint", info + " · 来源 " + (j.src||"—")));
       if (pos){
         var off = crossTrackNm(pos, [A.lon,A.lat], [B.lon,B.lat]);
         if (off > ROUTE_OFF_NM)
           rbox.append(el("div","hint",
-            "⚠ 该机当前偏离这条航线 " + fmt(Math.round(off)) + " nm。航线库按呼号查表，" +
+            "⚠ 该机当前偏离这条航线 " + U.dist(off) + "。航线库按呼号查表，" +
             "同一呼号不同日期会飞不同城市对，这条多半不是今天这一班。"));
       }
     })
@@ -1928,7 +2132,17 @@ window.__probe = function(){
                      trails:acTrails().features.length,
                      // 状态表里有不等于画出来了：shown 是当前视口内真正渲染出的图标数
                      shown:map.getLayer("flights") ? map.queryRenderedFeatures({layers:["flights"]}).length : -1 },
-           route:{ layer:!!map.getLayer("route-line"), n:routeN },
+           route:{ layer:!!map.getLayer("route-line"), n:routeN,
+                   // 航线两段各自的首尾，验收用来确认折点在飞机上
+                   legs:(function(){
+                     var s = map.getSource("route"), d = s && s.serialize().data, out = {};
+                     ((d && d.features) || []).forEach(function(f){
+                       if (f.geometry.type === "LineString"){ var c = f.geometry.coordinates;
+                         out[f.properties.k] = [c[0], c[c.length-1], c.length]; } });
+                     return out; })() },
+           units:metric ? "metric" : "imperial",
+           lenTxt:document.getElementById("lenTxt").textContent,
+           trails:{ on:trailsOn, vis:map.getLayer("flight-trails") ? map.getLayoutProperty("flight-trails","visibility") : null },
            sdr:window.__sdr ? window.__sdr.probe() : null,
            styleLoaded:map.isStyleLoaded(), layers:lyr.length,
            rendered:map.queryRenderedFeatures({layers:["ap"]}).length,
@@ -1969,6 +2183,8 @@ window.__probe = function(){
 };
 window.__act = { base:function(m){ document.getElementById("fBase").value=m; setBasemap(m); },
                  flights:function(on){ setFlights(!!on); },
+                 trails:function(on){ setTrails(on); },
+                 units:function(which){ setUnits(which); },
                  callsigns:function(){
                    var out=[]; for (var h in AC) if (AC[h].cs) out.push(AC[h].cs);
                    return out; },
@@ -1981,7 +2197,7 @@ window.__act = { base:function(m){ document.getElementById("fBase").value=m; set
                    if (pick) showFlightDetail(pick);
                    return pick ? pick.cs : null; },
                  // 往状态表里灌一个来源的快照，验收多来源合并时用，不经过网络
-                 ingest:function(src, list, trail){ acIngest(src, list, trail); acRender(true); },
+                 ingest:function(src, list){ acIngest(src, list); acRender(true); },
                  sdr:function(name, arg){ return window.__sdr ? window.__sdr.act(name, arg) : null; },
                  flightPos:function(hex){ return curFlightPos(hex); },
                  fly:function(lng,lat,z){ map.jumpTo({center:[lng,lat],zoom:z}); },
@@ -1997,7 +2213,9 @@ window.__act = { base:function(m){ document.getElementById("fBase").value=m; set
 // 页面主体是一个闭合的函数，外面的脚本够不着里面的任何东西。这里把扩展脚本
 // 需要的那一小部分明确交出去：地图、几个工具函数、飞机状态表的入口、钩子。
 window.__app = { map:function(){ return map; }, el:el, fmt:fmt,
-                 nmBetween:nmBetween, hooks:hooks,
+                 nmBetween:nmBetween, hooks:hooks, units:U,
+                 // 扩展脚本是异步到的：它来之前详情面板可能已经开着，要能让它重画一遍
+                 airport:{ shown:function(){ return shownAirport; }, show:showDetail },
                  ac:{ ingest:acIngest, render:acRender, show:acShow, count:acCount,
                       get:function(hex){ return AC[hex] || null; } } };
 
@@ -2011,17 +2229,18 @@ function boot(){
   document.getElementById("fBldg3d").addEventListener("change", toggleBldg3d);
 
   detectAssets().then(function(){
-    // 首帧走的是和 setBasemap("auto") 同一套判断：有网就在线，没网按预排顺序读本地
-    var goOnline = navigator.onLine !== false;
-    activeMode = goOnline ? "online" : (pmUrl ? "pmtiles" : "ne");
+    // 首帧走的是和 setBasemap(baseMode) 同一套判断。默认是离线；「自动」才看有没有网
+    baseMode = document.getElementById("fBase").value;
+    var goOnline = baseMode === "online" || (baseMode === "auto" && navigator.onLine !== false);
+    var pick = goOnline ? ["online", (baseMode === "auto" ? "自动 · " : "") + "在线底图载入中…"]
+                        : offlinePick(baseMode === "auto" ? "自动 · 无网络，" : "离线 · ");
+    activeMode = pick[0];
     offline = !goOnline;
     map = newMap(goOnline ? STYLE_URL
                           : (pmUrl ? protomapsStyle(pmUrl) : offlineStyle()));
     map.on("load", onStyleReady);
     map.on("style.load", onStyleReady);
-    hint({ online:"自动 · 在线底图载入中…",
-           pmtiles:"自动 · 无网络，用本地街道级底图",
-           ne:"自动 · 无网络，用 Natural Earth" }[activeMode]);
+    hint(pick[1]);
     if (goOnline){
       onlineTimer = setTimeout(function(){
         if (!offline && styleFailed())

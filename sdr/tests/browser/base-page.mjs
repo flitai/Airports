@@ -58,6 +58,9 @@ if (scenario === "file") {
 }
 
 if (scenario === "server") {
+  let p0 = await probe();
+  check("底图默认离线，不向在线底图发请求", p0.activeMode !== "online" && /^离线/.test(p0.baseHint) &&
+        await ev('document.getElementById("fBase").value') === "offline", { mode: p0.activeMode, hint: p0.baseHint });
   await ev("__act.fly(-0.45, 51.47, 8)");
   await ev("__act.flights(true)");
   let p = await until("net flights", async () => { const q = await probe(); return q.flights.n > 0 && q.flights.shown > 0 ? q : null; }, 40000);
@@ -78,6 +81,14 @@ if (scenario === "server") {
   const routeTxt = await until("route settle", () => ev('(function(){var h=document.querySelector("#dbody .cgrp .hint");return h&&h.textContent!=="查询中…"?document.querySelector("#dbody .cgrp").textContent.slice(0,80):""})()'), 20000);
   p = await probe();
   check("航线查询有结论", !!routeTxt, { routeTxt, routeN: p.route.n });
+  if (p.route.n) {
+    // 查到了航线：应当是「起点 → 飞机 → 终点」两段，折点就在飞机上（经度可以差整圈）
+    const here = await ev(`__act.flightPos(${JSON.stringify(hex)})`), L = p.route.legs;
+    const same = (a, b) => a && b && Math.abs(a[1] - b[1]) < 1e-3 && Math.abs((((a[0] - b[0]) % 360) + 540) % 360 - 180) < 1e-3;
+    check("航线经过飞机：起点 → 飞机 → 终点两段大圆", p.route.n === 4 && L.flown && L.togo &&
+          same(L.flown[1], here) && same(L.togo[0], here) && L.flown[2] > 10 && L.togo[2] > 10,
+          { flownEnd: L.flown && L.flown[1], togoStart: L.togo && L.togo[0], here });
+  }
 
   // 多来源合并：本地给同一架一个更新的位置，但不带注册号和机型
   const n0 = p.flights.n, tNow = Date.now() / 1000;
@@ -91,7 +102,18 @@ if (scenario === "server") {
   const sub1 = await ev('document.getElementById("dSub").textContent');
   const alt1 = await ev('document.querySelector("#dbody dd").textContent');
   check("注册号/机型没被本地空值冲掉", sub1 === sub0, { sub0, sub1 });
-  check("高度随位置来源整组切换", /1,?234/.test(alt1), { alt1 });
+  check("高度随位置来源整组切换（默认公制：1234 ft = 376 m）", alt1 === "376 m", { alt1 });
+
+  // 单位切换：详情面板、跑道筛选的标注一起换，再切回来
+  const dds = () => ev('[].map.call(document.querySelectorAll("#dbody dt"),function(d){return d.textContent+"="+d.nextElementSibling.textContent}).join(" | ")');
+  check("默认公制", (await probe()).units === "metric" && /地速=183 km\/h/.test(await dds()), await dds());
+  await ev('__act.units("imperial")');
+  p = await probe();
+  check("切到英制：高度英尺、地速节，面板原地重画", p.units === "imperial" && p.detailOpen && p.detailName === cs &&
+        /气压高度=1,234 ft \| 地速=99 kt/.test(await dds()) && p.lenTxt === "0 ft", { dl: await dds(), len: p.lenTxt });
+  await ev('__act.units("metric")');
+  p = await probe();
+  check("切回公制", p.units === "metric" && /气压高度=376 m/.test(await dds()) && p.lenTxt === "0 m", { len: p.lenTxt });
 
   // 本地位置比联网旧时不该赢
   await ev(`__act.ingest("local", [{hex:${JSON.stringify(hex)}, lat:${lp[1]}, lon:${lp[0]}, alt:1, gs:1, tr:1, t:1000}])`);
@@ -107,7 +129,17 @@ if (scenario === "server") {
 
   // 切底图：图层被销毁重建，飞机应当立刻还在
   const before = (await probe()).flights;
-  const target = (await probe()).activeMode === "offline" ? "online" : "offline";
+  // 尾迹开关：只管显示，飞机不受影响
+  p = await probe();
+  check("尾迹默认显示", p.trails.on === true && p.trails.vis === "visible", p.trails);
+  await ev("__act.trails(false)"); p = await probe();
+  check("关掉「显示尾迹」只隐藏尾迹，飞机还在", p.trails.vis === "none" && p.flights.layer &&
+        await ev('__app.map().getLayoutProperty("flights","visibility")') === "visible" &&
+        await ev('document.getElementById("fTrails").checked') === false, p.trails);
+  await ev("__act.trails(true)"); p = await probe();
+  check("重新打开尾迹", p.trails.vis === "visible", p.trails);
+
+  const target = (await probe()).activeMode === "online" ? "offline" : "online";
   await ev(`__act.base(${JSON.stringify(target)})`);
   const t0 = Date.now();
   p = await until("restyle", async () => { const q = await probe(); return q.styleLoaded && q.flights.layer && q.flights.shown > 0 ? q : null; }, 9000);

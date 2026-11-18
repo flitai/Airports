@@ -1,4 +1,4 @@
-"""合成 ADS-B 信号：从报文编码一路做到 2.4 MS/s 的原始 I/Q。
+"""合成信号：ADS-B 从报文编码一路做到 2.4 MS/s 的原始 I/Q；航空话音是带调制的载波。
 
 为什么要有它：SDR Lab 的测试夹具里没有真实录音（只留了指向缺失文件的说明），
 而自己录的回放文件含真实航班，不适合入库。有了合成信号，「原始采样 → readsb
@@ -165,4 +165,57 @@ class Modulator:
         iq = np.empty(2 * nsamples, np.float32)
         iq[0::2], iq[1::2] = buf[:nsamples].real, buf[:nsamples].imag
         iq += self.rng.normal(127.5, 1.5, 2 * nsamples).astype(np.float32)
+        return np.clip(np.rint(iq), 0, 255).astype(np.uint8).tobytes()
+
+
+class Station:
+    """一个合成的话音台：载波 + 单音调幅，可以按周期通断。
+
+    offset_hz 是载波偏离标称频率的量，用来验证自动频率跟踪；on_s / off_s 模拟
+    一问一答的通话节奏（off_s 为 0 即连续播发，像通播台）。
+    """
+    def __init__(self, hz, tone_hz=1000.0, offset_hz=0.0, on_s=1.0, off_s=0.0, amp=12.0, depth=0.6):
+        self.hz, self.tone_hz, self.offset_hz = float(hz), float(tone_hz), float(offset_hz)
+        self.on_s, self.off_s, self.amp, self.depth = float(on_s), float(off_s), float(amp), float(depth)
+
+    @classmethod
+    def parse(cls, text):
+        """MHz[@偏差Hz][~开秒[/关秒]][*单音Hz][%调制度]。
+
+        例如 118.5@-7000~4/2*1000；125.0%0 是不带调制的空载波，用来扮演干扰。
+        """
+        import re
+        m = re.fullmatch(r"([\d.]+)(?:@(-?[\d.]+))?(?:~([\d.]+)(?:/([\d.]+))?)?(?:\*([\d.]+))?(?:%([\d.]+))?", text.strip())
+        if not m:
+            raise ValueError("看不懂的合成台：" + text)
+        mhz, off, on, gap, tone, depth = m.groups()
+        return cls(float(mhz) * 1e6, float(tone or 1000), float(off or 0), float(on or 1), float(gap or 0),
+                   depth=float(depth) / 100 if depth else 0.6)
+
+
+class AirBand:
+    """把若干个 Station 铺成 cu8 采样块。只画落在当前窗口里的台。"""
+
+    def __init__(self, stations, seed=2, noise=1.5):
+        self.stations = list(stations)
+        self.rng = np.random.default_rng(seed)
+        self.noise = noise
+        self.pos = 0
+
+    def block(self, nsamples, center_hz):
+        n = np.arange(self.pos, self.pos + nsamples, dtype=np.float64)
+        t = n / RATE
+        buf = np.zeros(nsamples, np.complex128)
+        for s in self.stations:
+            off = s.hz + s.offset_hz - center_hz
+            if abs(off) > RATE / 2 - 20_000:
+                continue
+            period = s.on_s + s.off_s
+            keyed = (t % period) < s.on_s if s.off_s > 0 else 1.0
+            env = s.amp * (1 + s.depth * np.cos(2 * np.pi * s.tone_hz * t)) * keyed
+            buf += env * np.exp(2j * np.pi * (off / RATE) * n)
+        self.pos += nsamples
+        iq = np.empty(2 * nsamples, np.float32)
+        iq[0::2], iq[1::2] = buf.real, buf.imag
+        iq += self.rng.normal(127.5, self.noise, 2 * nsamples).astype(np.float32)
         return np.clip(np.rint(iq), 0, 255).astype(np.uint8).tobytes()

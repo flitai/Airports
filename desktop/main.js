@@ -170,6 +170,7 @@ function buildMenu() {
   if (WITH_SDR) {
     tpl.push({ label: "接收机", submenu: [
       { label: "接收 ADS-B", accelerator: "CmdOrCtrl+1", click: () => toPage("mode", "adsb") },
+      { label: "回到话音监听", accelerator: "CmdOrCtrl+2", click: () => toPage("mode", "air") },
       { label: "关闭并释放设备", accelerator: "CmdOrCtrl+.", click: () => toPage("mode", "off") },
       { type: "separator" },
       { label: "设定接收机位置…", click: () => toPage("pick", true) },

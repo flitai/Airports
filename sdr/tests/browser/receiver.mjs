@@ -31,9 +31,11 @@ const pos = async()=> ev('__act.flightPos("abc001")');
 const a1 = await pos(); await sleep(3200); const a2 = await pos();
 check("本地位置持续更新", a1 && a2 && (a1[0]!==a2[0]||a1[1]!==a2[1]), {a1,a2});
 p = await probe();
-check("航迹在增长", p.flights.trails===3, {trails:p.flights.trails});
+check("每架飞机身后有一段尾迹", p.flights.trails===3, {trails:p.flights.trails});
 
 // 详情面板里的本地信息
+// 呼号报文每 2 秒才来一条，飞机先有位置后有呼号：等到了再点
+await until("callsign", async()=> (await ev("__act.callsigns()")).includes("SYN001"), 15000);
 const cs = await ev('__act.clickFlight("SYN001")');
 const dl0 = await ev('[].map.call(document.querySelectorAll("#dbody dt"),function(d){return d.textContent+"="+d.nextElementSibling.textContent}).join(" | ")');
 check("航班详情标明本地接收和信号强度", cs==="SYN001" && /数据来源=本地接收 · 信号 -?[\d.]+ dBFS/.test(dl0), dl0);
@@ -48,7 +50,16 @@ await until("adsb back after decoder restart", async()=>{ const q=await probe();
 await until("callsign back", async()=> (await ev("__act.callsigns()")).includes("SYN001"), 15000);
 await ev('__act.clickFlight("SYN001")');
 const dl1 = await ev('[].map.call(document.querySelectorAll("#dbody dt"),function(d){return d.textContent+"="+d.nextElementSibling.textContent}).join(" | ")');
-check("详情显示距接收机距离（合成飞机半径 12 nm）", /距接收机=1[0-4] nm/.test(dl1), dl1);
+check("详情显示距接收机距离（合成飞机半径 12 nm ≈ 22 km）", /距接收机=2[0-5] km/.test(dl1), dl1);
+// 单位切换：距离圈、最远收到、距接收机一起换
+const rings = () => ev('__app.map().getSource("sdr-home").serialize().data.features.filter(function(f){return f.properties.k==="label"}).map(function(f){return f.properties.t}).join(",")');
+check("距离圈默认按公里", await rings() === "100 km,200 km,300 km,400 km", await rings());
+await ev('__act.units("imperial")');
+const dl2 = await ev('[].map.call(document.querySelectorAll("#dbody dt"),function(d){return d.textContent+"="+d.nextElementSibling.textContent}).join(" | ")');
+p = await probe();
+check("切到英制：距离圈、最远收到、距接收机都换成海里", await rings() === "50 nm,100 nm,150 nm,200 nm" && /最远收到 \d+ nm/.test(p.sdr.hint) && /距接收机=1[0-4] nm/.test(dl2), {rings:await rings(), hint:p.sdr.hint});
+await ev('__act.units("metric")');
+check("切回公制", await rings() === "100 km,200 km,300 km,400 km");
 
 // 点选模式与 Esc
 await ev('__act.sdr("pick", true)'); p = await probe();
@@ -68,7 +79,7 @@ await sleep(1300); p = await probe();
 check("图层仍然可见", p.flights.shown===3, {shown:p.flights.shown});
 
 // 切底图
-const target = p.activeMode==="offline" ? "online" : "offline";
+const target = p.activeMode==="online" ? "offline" : "online";
 await ev(`__act.base(${JSON.stringify(target)})`);
 p = await until("restyle", async()=>{ const q=await probe(); return q.styleLoaded && q.flights.layer && q.sdr.layers.home && q.flights.shown===3 ? q : null; }, 12000);
 check("切底图后本地飞机、航迹与接收机图层都重挂", p.sdr.layers.rings && p.sdr.layers.outline && p.flights.shown===3, {layers:p.sdr.layers, shown:p.flights.shown});

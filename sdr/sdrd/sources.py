@@ -30,6 +30,9 @@ class _Paced:
             raise DeviceError("error", f"这个采样源只有 {self.rate} S/s")
         self.center = int(center)
 
+    def tune(self, center):
+        self.center = int(center)
+
     def set_gain(self, db):
         return None                  # 没有可调的增益；返回 None 让引擎别再试
 
@@ -96,21 +99,27 @@ class FileReplaySource(_Paced):
             self.f = None
 
 
-class SynthAdsbSource(_Paced):
-    """合成的 ADS-B 流量，绕 center 转圈。"""
+class SynthSource(_Paced):
+    """合成信号：调到 1090 MHz 附近给 ADS-B 流量，调到别处给话音台。
+
+    两样合在一个采样源里，是因为要验的正是「同一只接收机在两种模式间来回切」。
+    """
     kind = "synth"
 
-    def __init__(self, center=(0.0, 0.0), count=3):
+    def __init__(self, center=(0.0, 0.0), count=3, stations=()):
         super().__init__()
         self.traffic = synth.Traffic(center, count)
         self.mod = synth.Modulator(self.traffic)
+        self.air = synth.AirBand(stations)
 
     def info(self):
         return {"model": "合成信号", "tuner": "—", "v4": False, "serial": "",
                 "range_hz": [0, 0], "gains": [], "simulated": True}
 
     def _next_block(self):
-        return self.mod.block(BUF_LEN // 2)
+        if abs(self.center - 1_090_000_000) < self.rate // 2:
+            return self.mod.block(BUF_LEN // 2)
+        return self.air.block(BUF_LEN // 2, self.center)
 
 
 def make_source(spec, ppm=0):
@@ -118,7 +127,8 @@ def make_source(spec, ppm=0):
 
     rtl                真实接收机（默认）
     file:<路径>         回放 cu8 录音
-    synth:adsb[:纬,经]  合成流量
+    synth:adsb[:纬,经][;air:<台>,<台>…]
+                       合成 ADS-B 流量；可再加几个合成话音台，写法见 synth.Station.parse
     """
     if spec == "rtl":
         from .device import RtlSource
@@ -126,7 +136,9 @@ def make_source(spec, ppm=0):
     if spec.startswith("file:"):
         return FileReplaySource(spec[5:])
     if spec.startswith("synth:adsb"):
-        rest = spec[len("synth:adsb"):].lstrip(":")
+        rest, _, air = spec[len("synth:adsb"):].partition(";air:")
+        rest = rest.lstrip(":")
         center = tuple(float(x) for x in rest.split(",")) if rest else (0.0, 0.0)
-        return SynthAdsbSource(center)
+        stations = [synth.Station.parse(x) for x in air.split(",") if x.strip()]
+        return SynthSource(center, stations=stations)
     raise ValueError(f"不认识的采样源：{spec}")

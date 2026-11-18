@@ -7,7 +7,8 @@ license = "GPL-3.0-or-later"
 # 依赖刻意压到最少。主程序 serve.py 仍然是纯标准库；只有显式用 --sdr 启用
 # 接收机的人才需要装这些。
 #   aiohttp  一个依赖同时解决 HTTP 和 WebSocket
-#   numpy    削顶统计、合成信号；后续的解调链也建立在它上面
+#   numpy    削顶统计、合成信号、话音解调链（滤波器设计也是自己用 numpy 写的，
+#            所以没有 scipy：那是 30 多 MB 的依赖，而用到的只是几个窗函数）
 dependencies = [
     "aiohttp>=3.9",
     "numpy>=1.26",

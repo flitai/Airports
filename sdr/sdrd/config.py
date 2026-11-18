@@ -16,6 +16,9 @@ DEFAULTS = {
     "gain": "auto",          # "auto" 或 dB 数值
     "ppm": 0,
     "outline": None,         # RangeOutline.to_json()
+    "squelch_db": 7.0,       # 载噪比（载波比信道带宽内的噪声）高于多少 dB 才开静噪
+    "voice_only": True,      # 无话音时静音：载波上没有调制（干扰、纯噪声）就不出声
+    "volume": 0.8,           # 0–1。存在这边，浏览器和桌面外壳共用一个音量
 }
 
 

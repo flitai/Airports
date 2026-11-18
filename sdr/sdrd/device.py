@@ -179,6 +179,18 @@ class RtlSource:
             self.center = int(self.lib.rtlsdr_get_center_freq(self.dev))
         self.set_gain(gain)
 
+    def tune(self, center):
+        """换中心频率，异步读取不停。
+
+        原版每次调谐都 cancel_async 再重开，要等首个回调，最长 5 秒。其实驱动的
+        调谐只是几次 USB 控制传输，和批量读取走的是不同的端点，可以并行；
+        rtl_tcp 就是这么做的。换完之后头几十毫秒的采样是锁相环还没稳住时的，
+        由调用方丢弃。
+        """
+        with self._lock:
+            self._check(self.lib.rtlsdr_set_center_freq(self.dev, int(center)), "调谐")
+            self.center = int(self.lib.rtlsdr_get_center_freq(self.dev))
+
     def set_gain(self, db):
         """设到增益表里最近的一档，返回实际生效的值。"""
         if not self.gains:

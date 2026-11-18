@@ -25,11 +25,13 @@ def main():
     ap = argparse.ArgumentParser(prog="sdrd", description="Airports 本地接收机守护进程")
     # 环境变量 SDR_SOURCE 是给「由 serve.py 拉起」的场合换采样源用的，比如无硬件验收
     ap.add_argument("--source", default=os.environ.get("SDR_SOURCE", "rtl"),
-                    help="rtl | file:<cu8 路径> | synth:adsb[:纬,经]")
+                    help="rtl | file:<cu8 路径> | synth:adsb[:纬,经][;air:<台>,…]")
     ap.add_argument("--port", type=int, default=0, help="监听端口，0 为自动挑选")
     ap.add_argument("--runtime-dir", default=os.path.join(ROOT, ".runtime"))
     ap.add_argument("--allow-origin", action="append", default=[],
                     help="允许连接的页面来源，可重复；不给则放行任意本机来源")
+    ap.add_argument("--auto-return-s", type=float, default=float(os.environ.get("SDR_AUTO_RETURN_S", 60)),
+                    help="话音模式下没有页面在出声，过这么多秒自动回到之前的模式")
     ap.add_argument("--parent-pipe", action="store_true",
                     help="标准输入一关闭就退出，用来跟随父进程的生死")
     args = ap.parse_args()
@@ -48,6 +50,8 @@ def main():
     server = Server(None, args.allow_origin)
     engine = Engine(cfg, args.source, args.runtime_dir, notify=server.notify)
     server.engine = engine
+    engine.auto_return_s = args.auto_return_s
+    engine.on_audio = server.audio
     info_path = os.path.join(args.runtime_dir, "sdrd.json")
 
     async def run():
