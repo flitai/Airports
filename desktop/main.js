@@ -227,6 +227,7 @@ function buildMenu() {
       { label: "回到话音监听", accelerator: "CmdOrCtrl+2", click: () => toPage("mode", "air") },
       { label: "关闭并释放设备", accelerator: "CmdOrCtrl+.", click: () => toPage("mode", "off") },
       { type: "separator" },
+      { label: "频谱与瀑布图", accelerator: "CmdOrCtrl+3", click: () => toPage("view") },
       { label: "设定接收机位置…", click: () => toPage("pick", true) },
     ] });
   }

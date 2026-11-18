@@ -52,6 +52,7 @@ def main():
     server.engine = engine
     engine.auto_return_s = args.auto_return_s
     engine.on_audio = server.audio
+    engine.on_spectrum = server.spectrum
     info_path = os.path.join(args.runtime_dir, "sdrd.json")
 
     async def run():

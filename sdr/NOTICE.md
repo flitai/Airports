@@ -14,7 +14,8 @@ SDR Lab 是一个基于 RTL-SDR Blog V3 的桌面信号探索工作台（Python 
 | `sdrd/config.py` | `sdrlab/preferences.py` | 只借了「原子替换写 JSON」的做法 |
 
 | `sdrd/dsp/channels.py` | `sdrlab/exploration.py`（`validate_channels`、`channel_centers`） | 保留：按频率聚成组、每组一个中心频率、让频道避开直流毛刺。改动：直接吃机场频率表而不是手工维护的频道表；懂 8.33 kHz 频道名；去掉 64 行上限；分组保证窗口数最少，并按频道类型加权 |
-| `sdrd/dsp/spectrum.py` | `sdrlab/spectral.py`、`sdrlab/trigger.py` 的 `channel_excess` | 保留：汉宁窗分段平均的功率谱、「频道功率比邻近底噪」并以中位数估底噪。改动：分子取载波谱线、分母折算到信道带宽，得到载噪比；顺带给出载波的频率偏差 |
+| `sdrd/dsp/spectrum.py` | `sdrlab/spectral.py`、`sdrlab/trigger.py` 的 `channel_excess` | 保留：汉宁窗分段平均的功率谱、「频道功率比邻近底噪」并以中位数估底噪。改动：分子取载波谱线、分母折算到信道带宽，得到载噪比；顺带给出载波的频率偏差；瀑布图的行直接由解调用的同一份谱累加而成，量化成 8 位发给页面 |
+| `sdrd/dsp/candidates.py` | `sdrlab/search.py` 的 `CandidateDetector` | 保留：对平均功率谱做能量检测、连成段、剔除中心的直流毛刺，再按频率把逐次检测并成候选条目；「能量检测只说明有东西，不说明是什么」的态度。改动：强度和门限改用载噪比，与静噪同一个标准；频率取最强谱线而不是功率重心；不按频段猜调制方式；候选跨窗口保留；不依赖 scipy。扫描与驻留策略（`SearchPolicy`）没有移植 |
 | `sdrd/dsp/am.py` | `sdrlab/processors.py` 的 `AnalogDemod`（AM 分支）、`sdrlab/audio.py` 的限幅 | 保留：先信道滤波再检波再语音带通的顺序、同步检波、0.75 以上才软限幅。改动：加自动频率跟踪；信道滤波收窄到 ±3 kHz；按载波幅度归一；用同相 / 正交两路的功率比判断有没有话音（取代原版依赖语音识别库的做法）；滤波器全部改为 numpy 实现的线性相位 FIR，不依赖 scipy |
 
 `sdrd/dsp/xlate.py`（移频、滤波、抽取合成一步）是新写的，取代 `processors.py` 里的全速率混频。

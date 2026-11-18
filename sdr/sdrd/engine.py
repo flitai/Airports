@@ -9,7 +9,7 @@
 线程：
   rtl-usb / iq-*   采样源的回调，只调 _on_block
   adsb-pipe        往 readsb 写管道
-  sdr-dsp          话音模式下的频谱、静噪和解调（见 air.Monitor）
+  sdr-dsp          话音模式下的频谱、静噪和解调（见 air.Monitor）；两种模式下瀑布图的行
   sdr-engine       本文件的 run()：处理命令、开关设备、调谐、轮巡、每秒读一次解码结果
 
 采样率全程 2.4 MS/s。模式之间、窗口之间的切换都只是重调谐，设备不关、异步读取
@@ -26,7 +26,10 @@ import numpy as np
 from . import adsb
 from .air import Monitor
 from .device import DeviceError
+from .dsp import candidates as cand
 from .dsp import channels as chan
+from .dsp import to_complex
+from .dsp.spectrum import ROW_BLOCKS, ROW_S, Rows, Spectrum, spectrum_frame
 from .geo import RangeOutline
 from .sources import make_source
 
@@ -39,6 +42,7 @@ SILENT_S = 4.0                       # 正在听的频道载波亮了这么久�
 STUCK_S = 20.0                       # 一个通话频道连续亮了这么久，就当它是常驻载波（干扰，或卡住的话筒）
 FRESH_S = 60                         # 超过这么久没收到任何报文的飞机不再上报
 CLIP_HIGH, CLIP_LOW = 0.005, 0.0002  # 削顶比例：高于前者降一档增益，低于后者升一档
+SETTLE_S = 0.08                      # 重调谐后这么久之内的采样不拿来画频谱，锁相环还没稳住
 ZERO = {"ac": 0, "ac_pos": 0, "msg_rate": 0}
 
 
@@ -92,9 +96,21 @@ class Engine:
         self._listen_at = 0.0            # 当前这个频道是什么时候开始解调的
         self._manual_id = 10_000
 
+        # ---- 频谱 ----
+        # 频谱不是一种模式：话音和 ADS-B 下都有，有页面在看（watchers）才往外发。
+        # 话音模式下谱是解调本来就要算的，白拿；ADS-B 模式下没人看就一格都不算。
+        self.on_spectrum = None          # function(bytes)：一行频谱，由 sdr-dsp 线程调用
+        self.watchers = 0                # 有几个页面开着瀑布图，由服务端维护
+        self.tracker = cand.Tracker()    # 候选信号。跨窗口保留，所以放在这儿而不是 Monitor 里
+        self._rows = Rows()
+        self._plain = Spectrum()         # ADS-B 模式下画瀑布图用的谱
+        self._plain_rows = Rows(blocks=1)    # 那边是 6 块里抽 1 块，抽到的每块就是一行
+        self._row_seq = 0
+
         self._snap = {"aircraft": {"t": "aircraft", "list": []},
                       "channels": {"t": "channels", "win": 0, "listen": None, "open": False,
                                    "voice": False, "level": {}, "active": [], "steady": []},
+                      "candidates": {"t": "candidates", "list": []},
                       "outline": dict(self.outline.to_json(), t="outline")}
         self._snap["status"] = self._status({})
 
@@ -278,6 +294,27 @@ class Engine:
                        air.get("label") or "手动调谐", air.get("airport"), air.get("skipped", 0))
         return {"ok": True}
 
+    def _op_drop(self, op):
+        """删掉手动调出来的频道。它不来自任何频率表，不删就一直留在频道条上。"""
+        ch = self._channel(op.get("ch"))
+        if not ch or not ch.get("manual"):
+            return {"ok": False, "code": "bad_channel", "msg": "只有手动调出来的频道可以删除"}
+        air = self.air
+        kept = [c for c in air["channels"] if not c.get("manual")]
+        if not kept:                     # 频道表里只有它：没什么可听的了，回到进话音之前的模式
+            self.air = None
+            if self.mode == "air":
+                self._set_mode(self._return_to)
+            return {"ok": True}
+        mode, patrol = self.mode, air["patrol"]
+        # 正在听的不是它就接着听原来的；正在听的就是它，则由 _set_plan 另挑一个
+        self._set_plan(kept, air["listen"] if air["listen"] != ch["id"] else None,
+                       air["label"], air["airport"], air["skipped"])
+        self.air["patrol"] = patrol      # 删一个频道不该顺手把轮巡关了
+        if mode != "air":                # 不在话音模式时只是整理频道表，不借机切进去
+            self._set_mode(mode)
+        return {"ok": True}
+
     def _tune_window(self, win):
         """把接收机调到第 win 个窗口，并为它建一个新的 Monitor。"""
         air, src = self.air, self.source
@@ -357,19 +394,44 @@ class Engine:
     def _dsp_run(self):
         while not self._quit.is_set():
             try:
-                gen, block = self._dspq.get(timeout=0.5)
+                rf, gen, block = self._dspq.get(timeout=0.5)
             except queue.Empty:
                 continue
-            mon = self.monitor
-            if mon is None or mon.gen != gen:
-                continue                 # 重调谐之前排进来的，频率已经不对了
             try:
-                mon.feed(block)
+                if rf == "air":
+                    mon = self.monitor
+                    if mon is None or mon.gen != gen:
+                        continue         # 重调谐之前排进来的，频率已经不对了
+                    if mon.feed(block):
+                        self._row(mon.center, self._rows.add(mon.center, mon.spectrum.power), True)
+                elif self._rf == "adsb" and gen == self._gen and time.monotonic() - self._tuned_at > SETTLE_S:
+                    power = self._plain.update(to_complex(block))
+                    self._row(adsb.CENTER, self._plain_rows.add(adsb.CENTER, power), False)
             except Exception as e:       # 解调出错不该带走线程；记下来给状态条显示
                 self._dsp_error = "%s: %s" % (type(e).__name__, e)
 
+    def _row(self, center, row, air):
+        """sdr-dsp 线程：攒够了一行频谱。话音模式下顺便找候选信号；有人在看才发帧。"""
+        if row is None:
+            return
+        if air:
+            # 门限就是静噪门限：候选的意思是「强到能开静噪的载波」，与指示灯一个标准
+            self.tracker.update(cand.detect(row, center, self.cfg.get("squelch_db")), time.monotonic(), ROW_S)
+        if self.watchers and self.on_spectrum:
+            self._row_seq += 1
+            self.on_spectrum(spectrum_frame(self._row_seq, center, row))
+
+    def _candidates(self, now):
+        """候选列表，并标出哪些其实是频道表里的频道（落在它的频率跟踪范围内）。"""
+        rows = self.tracker.snapshot(now)
+        chs = self.air["channels"] if self.air else []
+        for r in rows:
+            near = [c for c in chs if abs(r["hz"] - c["hz"]) <= (2_500 if c["spacing"] == "8.33" else 9_000)]
+            r["ch"] = min(near, key=lambda c: abs(r["hz"] - c["hz"]))["id"] if near else None
+        return rows
+
     OPS = {"mode": _op_mode, "home": _op_home, "set": _op_set, "channels": _op_channels,
-           "listen": _op_listen, "window": _op_window, "tune": _op_tune}
+           "listen": _op_listen, "window": _op_window, "tune": _op_tune, "drop": _op_drop}
 
     # ---- 采样块入口（采样源线程）----
     def _on_block(self, block):
@@ -380,9 +442,15 @@ class Engine:
             dec = self.decoder
             if dec is not None:
                 dec.feed(block)
+            # 有人开着瀑布图才抽块去算频谱，6 块抽 1 块，与话音模式的行速率一致
+            if self.watchers and self._blocks % ROW_BLOCKS == 0:
+                try:
+                    self._dspq.put_nowait((rf, self._gen, block))
+                except queue.Full:       # 只是少画一行，不值得上报
+                    pass
         elif rf == "air":
             try:
-                self._dspq.put_nowait((self._gen, block))
+                self._dspq.put_nowait((rf, self._gen, block))
             except queue.Full:           # 解调跟不上了：丢块并如实上报，绝不堵 USB 回调
                 self._dsp_drops += 1
         if self._blocks & 7 == 0:        # 每 8 块抽一块算削顶，约 9 次/秒，开销可忽略
@@ -432,11 +500,13 @@ class Engine:
             self._publish(aircraft={"t": "aircraft", "list": []})
         self._rf, self.monitor = None, None
         if want == "adsb":
+            self._gen += 1               # 作废排队中的旧块，见 _tune_window
             try:
                 self.source.tune(adsb.CENTER)
             except DeviceError as e:
                 self.error, self._lost = str(e), True
                 return
+            self._tuned_at = time.monotonic()
             self._start_decoder()
             self._rf = "adsb"
         else:
@@ -542,6 +612,7 @@ class Engine:
                 "voice_only": bool(self.cfg.get("voice_only")),
                 "audio": {"listeners": self.listeners, "frames": self._frames,
                           "dsp_drops": self._dsp_drops},
+                "spectrum": {"watchers": self.watchers, "rows": self._row_seq},
                 "return_to": self._return_to,
                 "auto_return_s": self._idle_left if self.mode == "air" else None,
                 "warnings": warnings}
@@ -599,6 +670,8 @@ class Engine:
                     if self._rf == "adsb":
                         part = self._poll_decoder(now)
                     self._air_tick(now)
+                    if self._rf == "air":
+                        self._publish(candidates={"t": "candidates", "list": self._candidates(now)})
                 self._publish(status=self._status(part))
         finally:
             # 退出时一定关设备，Bias-T 也在这里关掉。解码进程不等它收尾（要 3 秒）：

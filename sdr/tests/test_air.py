@@ -1,5 +1,6 @@
 """话音模式的引擎行为：用合成的话音台，不需要接收机。"""
 import os
+import struct
 import tempfile
 import time
 import unittest
@@ -56,6 +57,16 @@ class Air(unittest.TestCase):
     def air(self):
         return self.eng.snapshot("status")["air"]
 
+    def air_when(self, ok):
+        """等状态快照追上刚发的命令再读：应答先到，快照晚一拍。"""
+        air = wait_for(lambda: self.air() if self.air() and ok(self.air()) else None, 5)
+        self.assertIsNotNone(air, "5 秒内状态快照没有变成预期的样子")
+        return air
+
+    @staticmethod
+    def manual_of(air):
+        return next((c for c in air["channels"] if c["type"] == "手动"), None)
+
     def test_listen_from_frequency_table(self):
         self.assertEqual(self.cmd(op="mode", mode="air")["code"], "no_channels")     # 没选频道进不了话音
         t0 = time.time()
@@ -86,7 +97,11 @@ class Air(unittest.TestCase):
         self.assertEqual(c["listen"], 2)
         self.assertEqual(self.eng.snapshot("status")["device"]["state"], "ready")
         wait_for(lambda: len(self.frames) > n + 60)
-        self.assertEqual(self.frames[n][1], 1)
+        # 新的一段以带「开始」标志的帧起头。它前面可能还夹着旧频道的一两帧：
+        # 命令发出时解调线程手里正在处理的那一块
+        starts = [i for i, f in enumerate(self.frames[n:n + 60]) if f[1] == 1]
+        self.assertEqual(len(starts), 1)
+        self.assertLessEqual(starts[0], 2)
         self.assertAlmostEqual(tone_of(self.frames[n + 20:n + 60]), 500, delta=30)
         self.assertEqual(self.eng.snapshot("status")["audio"]["dsp_drops"], 0)
 
@@ -99,15 +114,44 @@ class Air(unittest.TestCase):
         self.assertEqual(self.cmd(op="listen", ch=99)["code"], "bad_channel")
         # 方向键步进：从 121.900 上一格到 121.925，表里没有，成为一个手动频道
         self.assertTrue(self.cmd(op="tune", step=1)["ok"])
-        air = self.air()
+        air = self.air_when(self.manual_of)
         m = next(c for c in air["channels"] if c["id"] == air["listen"])
         self.assertEqual((m["label"], m["type"], m["rows"]), ("121.925", "手动", []))
         # 再退一格回到 121.900：落在表里已有的频道上，手动频道随之消失
         self.assertTrue(self.cmd(op="tune", step=-1)["ok"])
-        air = self.air()
+        air = self.air_when(lambda a: not self.manual_of(a))
         self.assertEqual(air["listen"], 1)
         self.assertEqual(len(air["channels"]), 4)
         self.assertEqual(self.cmd(op="tune", hz=150e6)["code"], "bad_tune")
+        # 手动频道可以删。正在听的就是它：删掉后改听同窗口里别的频道，仍在话音模式
+        self.cmd(op="tune", step=1)
+        manual = self.air_when(self.manual_of)["listen"]
+        self.assertEqual(self.cmd(op="drop", ch=1)["code"], "bad_channel")        # 频率表里的频道不能删
+        self.assertTrue(self.cmd(op="set", patrol=True)["ok"])
+        self.assertTrue(self.cmd(op="drop", ch=manual)["ok"])
+        air = self.air_when(lambda a: not self.manual_of(a))
+        self.assertEqual((len(air["channels"]), air["patrol"]), (4, True))        # 轮巡没被顺手关掉
+        self.assertNotEqual(air["listen"], manual)
+        self.assertEqual(self.eng.snapshot("status")["mode"], "air")
+        self.assertEqual(self.cmd(op="drop", ch=manual)["code"], "bad_channel")   # 已经没有了
+        # 正在听的是别的频道：删手动频道不打断它
+        self.cmd(op="set", patrol=False)
+        self.cmd(op="tune", hz=118_950_000)
+        manual = self.air_when(self.manual_of)["listen"]
+        self.cmd(op="listen", ch=0)
+        self.assertTrue(self.cmd(op="drop", ch=manual)["ok"])
+        air = self.air_when(lambda a: not self.manual_of(a))
+        self.assertEqual((air["listen"], len(air["channels"])), (0, 4))
+
+    def test_dropping_the_only_channel_leaves_voice_mode(self):
+        self.assertTrue(self.cmd(op="tune", hz=136_975_000)["ok"])                # 没选机场，直接敲了个频率
+        air = wait_for(self.air)
+        self.assertEqual(len(air["channels"]), 1)
+        self.assertTrue(self.cmd(op="drop", ch=air["listen"])["ok"])
+        st = wait_for(lambda: self.eng.snapshot("status") if self.eng.snapshot("status")["mode"] == "off" else None)
+        self.assertIsNotNone(st)                                                  # 回到进话音之前的模式
+        self.assertIsNone(st["air"])
+        self.assertTrue(wait_for(lambda: self.eng.snapshot("status")["device"]["state"] == "released"))
 
     def test_patrol_follows_speech_and_skips_continuous_broadcasts(self):
         self.cmd(op="channels", list=ROWS[1:4], pick=0)              # 地面 / 通播 / 进近，三个窗口
@@ -167,13 +211,98 @@ class Air(unittest.TestCase):
         self.assertTrue(wait_for(lambda: len(self.frames) > 20, 3))
         self.assertFalse(Config(os.path.join(self.tmp.name, "sdr.json")).get("voice_only"))
         self.cmd(op="set", voice_only=True)
-        # 换到有调制的塔台：照常出声，开头一帧带「开始」标志
+        # 换到有调制的塔台：照常出声，开头一帧带「开始」标志。
+        # 先等上一段收尾：不满一帧的尾巴是下一块采样到了才补发的，不等的话它会混进新的一段里
+        time.sleep(0.3)
         del self.frames[:]
         self.cmd(op="listen", ch=1)
         self.assertTrue(wait_for(lambda: len(self.frames) > 40, 5))
         self.assertTrue(self.chan()["voice"])
         self.assertEqual(self.frames[0][1], 1)
         self.assertAlmostEqual(tone_of(self.frames[10:40]), 1000, delta=30)
+
+    def head(self, frame):
+        kind, _, seq, center, span, floor, _, n = struct.unpack("<BBHIIBBH", frame[:16])
+        return {"kind": kind, "seq": seq, "center": center, "span": span, "floor": floor, "n": n}
+
+    def test_waterfall_rows_follow_the_window(self):
+        rows = []
+        self.eng.on_spectrum = rows.append
+        self.cmd(op="channels", list=ROWS, pick=0)
+        self.assertTrue(wait_for(lambda: self.chan()["open"]))
+        time.sleep(0.5)
+        self.assertEqual(rows, [])                                    # 没有页面在看：一行都不发
+        self.eng.watchers = 1
+        self.assertTrue(wait_for(lambda: rows))
+        n0, t0 = len(rows), time.time()
+        time.sleep(3)
+        rate = (len(rows) - n0) / (time.time() - t0)
+        self.assertTrue(10 <= rate <= 15, rate)                       # 每秒 12 行上下
+        air = self.air()
+        h = self.head(rows[-1])
+        self.assertEqual((h["kind"], h["center"], h["n"]), (2, air["windows"][0]["center_hz"], len(rows[-1]) - 16))
+        q = np.frombuffer(rows[-1][16:], np.uint8)
+        peak = h["center"] + (int(q.argmax()) - h["n"] / 2) * h["span"] / h["n"]
+        self.assertAlmostEqual(peak, 118_500_000 - 7000, delta=600)   # 最亮的一格就是偏了 7 kHz 的塔台
+        self.assertGreater(int(q.max()) - h["floor"], 60)             # 比底噪高 30 dB 以上（0.5 dB 一级）
+        self.assertEqual((h["seq"] - self.head(rows[-2])["seq"]) & 0xFFFF, 1)
+        st = wait_for(lambda: self.eng.snapshot("status") if self.eng.snapshot("status")["spectrum"]["rows"] > n0 else None)
+        self.assertEqual(st["spectrum"]["watchers"], 1)
+        # 换到另一个窗口：行里的中心频率跟着变，页面靠它知道该画在哪儿
+        self.cmd(op="listen", ch=2)
+        want = air["windows"][2]["center_hz"]
+        self.assertTrue(wait_for(lambda: self.head(rows[-1])["center"] == want, 3))
+        self.assertEqual(self.eng.snapshot("status")["audio"]["dsp_drops"], 0)
+
+    def test_candidates_know_which_ones_are_in_the_table(self):
+        # 119.3 上多一根载波，频率表里没有它；它和塔台、进近在同一个窗口里
+        self.eng.stop()
+        self.eng = Engine(self.cfg, SOURCE + ",119.3%0", self.tmp.name)
+        self.eng.listeners = 1
+        self.eng.start()
+        self.assertEqual(self.eng.snapshot("candidates")["list"], [])
+        self.cmd(op="channels", list=ROWS, pick=0)
+        got = wait_for(lambda: self.eng.snapshot("candidates")["list"] if len(self.eng.snapshot("candidates")["list"]) >= 2 else None)
+        self.assertIsNotNone(got)                                     # 不用有人开着瀑布图，候选照样在找
+        by = {round(c["hz"] / 1e5): c for c in got}
+        twr, stray = by[1185], by[1193]
+        self.assertEqual((twr["ch"], stray["ch"]), (0, None))         # 塔台偏了 7 kHz 也认得出是表里的那个
+        self.assertAlmostEqual(twr["hz"], 118_493_000, delta=600)
+        self.assertAlmostEqual(stray["hz"], 119_300_000, delta=600)
+        self.assertEqual((twr["age_s"], stray["age_s"]), (0, 0))
+        self.assertGreater(twr["db"], 30)
+        self.assertEqual(len(got), 2)                                 # 安静的进近不在里面
+        run = wait_for(lambda: [c for c in self.eng.snapshot("candidates")["list"] if c["id"] == stray["id"] and c["run_s"] > 2], 6)
+        self.assertTrue(run)                                          # 一直在：连续时长在涨
+        # 换到别的窗口再看：之前见过的还记着，只是标成不在了
+        self.cmd(op="listen", ch=2)
+        gone = wait_for(lambda: [c for c in self.eng.snapshot("candidates")["list"] if c["id"] == stray["id"] and c["age_s"] >= 2], 6)
+        self.assertTrue(gone)
+        self.assertEqual(gone[0]["run_s"], 0)
+        live = [c for c in self.eng.snapshot("candidates")["list"] if c["age_s"] == 0]
+        self.assertEqual([c["ch"] for c in live], [2])                # 此刻在的排最前：这个窗口里的通播
+
+    def test_adsb_mode_computes_spectrum_only_while_someone_watches(self):
+        rows = []
+        self.eng.on_spectrum = rows.append
+        self.cmd(op="mode", mode="adsb")
+        self.assertTrue(wait_for(lambda: self.eng._rf == "adsb"))
+        time.sleep(1.0)
+        self.assertEqual((rows, self.eng._dspq.qsize()), ([], 0))     # 没人看：不抽块、不算谱
+        self.eng.watchers = 1
+        self.assertTrue(wait_for(lambda: rows))
+        n0, t0 = len(rows), time.time()
+        time.sleep(2)
+        rate = (len(rows) - n0) / (time.time() - t0)
+        self.assertTrue(10 <= rate <= 15, rate)
+        h = self.head(rows[-1])
+        self.assertEqual((h["kind"], h["center"]), (2, adsb.CENTER))
+        self.assertEqual(self.eng.snapshot("candidates")["list"], [])  # 1090 MHz 上不找候选
+        self.eng.watchers = 0
+        time.sleep(0.3)
+        n1 = len(rows)
+        time.sleep(0.7)
+        self.assertEqual(len(rows), n1)
 
     def test_returns_when_nobody_listens(self):
         self.cmd(op="mode", mode="adsb")

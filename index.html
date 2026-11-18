@@ -2215,7 +2215,13 @@ window.__act = { base:function(m){ document.getElementById("fBase").value=m; set
 window.__app = { map:function(){ return map; }, el:el, fmt:fmt,
                  nmBetween:nmBetween, hooks:hooks, units:U,
                  // 扩展脚本是异步到的：它来之前详情面板可能已经开着，要能让它重画一遍
-                 airport:{ shown:function(){ return shownAirport; }, show:showDetail },
+                 airport:{ shown:function(){ return shownAirport; }, show:showDetail,
+                           // 扩展脚本拿机场的代码和位置（比如推测一个信号属于附近哪个机场）。
+                           // 代码走 icaoOf：ident 不等于 ICAO 代码
+                           info:function(id){
+                             var r = rowById(id); if (!r) return null;
+                             return { id:id, code:icaoOf(r, DT[id] || {}) || r[IDENT], name:r[NAME],
+                                      lat:r[LAT], lon:r[LON] }; } },
                  ac:{ ingest:acIngest, render:acRender, show:acShow, count:acCount,
                       get:function(hex){ return AC[hex] || null; } } };
 

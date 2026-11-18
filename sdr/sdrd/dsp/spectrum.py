@@ -12,13 +12,27 @@
 
 一次 FFT 4096 点，每块 32768 个采样点正好切成 8 段取平均：分辨率 586 Hz，
 每块（13.65 毫秒）出一份。静噪的时序就建立在「块」这个单位上。
+
+瀑布图用的是同一份谱：Rows 把 6 块攒成一行（每秒约 12 行），spectrum_frame 把一行
+量化成 8 位发给页面。不为了画图另算一遍 FFT。
 """
+import struct
+
 import numpy as np
 
 from . import RATE
 
 NFFT = 4096
 BIN_HZ = RATE / NFFT
+# 瀑布图只画中间 80%：两边是抗混叠滤波器的滚降区，底噪在那里塌下去，画出来像是
+# 「这一段很安静」，其实是接收机看不见。与 channels.USABLE（1.92 MHz）是同一个范围。
+ROW_BINS = 3276
+ROW_LO = NFFT // 2 - ROW_BINS // 2
+ROW_SPAN_HZ = round(ROW_BINS * BIN_HZ)
+ROW_BLOCKS = 6                           # 6 块一行：73 块/秒 ÷ 6 ≈ 12.2 行/秒
+ROW_S = ROW_BLOCKS * 32768 / RATE        # 一行代表多长时间
+SPECTRUM_FRAME = 2                       # 二进制帧的类型字节（1 是音频，见 air.py）
+DB_MIN, DB_STEP = -120.0, 0.5            # 8 位量化：0 = −120 dBFS，每级 0.5 dB，到 +7.5 dBFS
 _REF_BINS = 100                          # 底噪参考：两侧各 100 格，约 ±58.6 kHz
 _ENBW_HZ = 1.5 * BIN_HZ                  # 汉宁窗下一格的等效噪声带宽
 # 解调用的信道带宽（见 am.CHANNEL_BW_HZ，7.6 kHz）比一格宽多少 dB。写死是为了不反过来依赖 am
@@ -68,6 +82,59 @@ class Spectrum:
     def floor_db(self):
         """整窗底噪（dBFS/格），给界面显示接收状况用。"""
         return None if self.power is None else float(10 * np.log10(max(float(np.median(self.power)), 1e-20)))
+
+
+class Rows:
+    """把逐块的功率谱攒成瀑布图的行：按线性功率取平均，只留可用的中间一段。
+
+    取平均而不是取最大：一次通话持续几秒，平均不会漏掉它，而噪声被压平之后
+    弱信号才从底噪里显出来。中心频率变了，攒到一半的那行就不要了——前后两半
+    不是同一段频谱。
+    """
+    def __init__(self, blocks=ROW_BLOCKS):
+        self.blocks = blocks
+        self.center = None
+        self.acc, self.n = None, 0
+
+    def add(self, center_hz, power):
+        """power 是 Spectrum.power（4096 格）。攒够了返回一行（ROW_BINS 格），否则 None。"""
+        if center_hz != self.center:
+            self.center, self.acc, self.n = center_hz, None, 0
+        part = power[ROW_LO:ROW_LO + ROW_BINS]
+        if self.acc is None:
+            self.acc = part.astype(np.float64)
+        else:
+            self.acc += part
+        self.n += 1
+        if self.n < self.blocks:
+            return None
+        row, self.acc, self.n = self.acc / self.n, None, 0
+        return row
+
+
+def quantize(row):
+    db = 10 * np.log10(np.maximum(row, 1e-20))
+    return np.clip(np.rint((db - DB_MIN) / DB_STEP), 0, 255).astype(np.uint8)
+
+
+def spectrum_frame(seq, center_hz, row):
+    """一行频谱 → 二进制帧。帧头 16 字节（小端）：
+
+        0      类型 = 2
+        1      标志（保留）
+        2–3    行序号
+        4–7    中心频率 Hz
+        8–11   跨度 Hz
+        12     整行底噪（中位数），与数据同一量化
+        13     保留
+        14–15  格数
+        16…    每格一字节，dBFS = 值 × DB_STEP + DB_MIN
+
+    每行自带中心频率和跨度：重调谐前后排在路上的行，页面都知道该画在哪儿。
+    """
+    q = quantize(row)
+    return struct.pack("<BBHIIBBH", SPECTRUM_FRAME, 0, seq & 0xFFFF, int(center_hz), ROW_SPAN_HZ,
+                       int(np.median(q)), 0, len(q)) + q.tobytes()
 
 
 class Squelch:

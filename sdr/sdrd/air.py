@@ -85,12 +85,17 @@ class Monitor:
 
     # ---- sdr-dsp 线程 ----
     def feed(self, block):
+        """→ 这一块有没有算出新的功率谱（self.spectrum.power）。瀑布图靠它决定要不要取。"""
         if self.settle > 0:
             self.settle -= 1
-            return
+            return False
         x = to_complex(block)
         if self.spectrum.update(x) is None:
-            return
+            return False
+        self._demod(x)
+        return True
+
+    def _demod(self, x):
         now = time.monotonic()
         tuned = self.tuned
         gate = False
