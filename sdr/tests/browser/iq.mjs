@@ -28,7 +28,7 @@ await ev('__act.sdr("listenRow", 12)');                  // 塔台 118.5
 let s = await until("tower", async()=>{ const q=await sdr(); return q.mode==="air" && q.air?.open && q.audio.frames>40 && q.spectrum.stats ? q : null; }, 20000);
 
 // ---- 手动录一段 ----
-check("标题行有「录 I/Q」按钮；还没有录过", s.iq.buttonShown && s.iq.button==="录 I/Q" && !s.iq.live && s.iq.count===0 && s.iq.tabText==="I/Q" && !s.replay, s.iq);
+check("标题行有「立即录 I/Q」按钮；还没有录过", s.iq.buttonShown && s.iq.button==="立即录 I/Q" && !s.iq.live && s.iq.count===0 && s.iq.tabText==="I/Q" && !s.replay, s.iq);
 await ev('__act.sdr("sideTab", "iq")'); s = await sdr();
 check("右侧栏的「I/Q」页：空的，并说明怎么录", s.iq.shown && /还没有 I\/Q/.test(s.iq.sum) && s.iq.clear===null, s.iq.sum);
 const center = s.rf.center_hz;
@@ -42,7 +42,7 @@ s = await until("captured", async()=>{ const q=await sdr(); return q.iq.count===
 const cap = s.iq.list[0];
 check("再按停止：存下整个窗口，带上按下之前的一秒半", cap.kind==="manual" && cap.mode==="air" && cap.center_hz===center && cap.listen==="118.500" && cap.airport===EGLL && cap.duration_s>=3.6 && cap.duration_s<=6 && cap.dropped_blocks===0 && cap.bytes===Math.round(cap.duration_s*4.8e6/65536)*65536, {dur:cap.duration_s, bytes:cap.bytes, name:cap.name});
 check("列表里写明时刻、时长、哪个窗口、多大", /^\d\d:\d\d:\d\d$/.test(s.iq.rows[0].time) && /^\d\.\d 秒$/.test(s.iq.rows[0].dur) && s.iq.rows[0].name==="窗口 "+(center/1e6).toFixed(3)+" · EGLL" && /^\d+(\.\d)? MB$/.test(s.iq.rows[0].size) && s.iq.rows[0].icon==="▶", s.iq.rows[0]);
-check("页签和底栏报数", s.iq.tabText==="I/Q 1" && /^1 段 · \d+(\.\d)? MB \/ 2000 MB$/.test(s.iq.sum) && s.iq.button==="录 I/Q", {tab:s.iq.tabText, sum:s.iq.sum});
+check("页签和底栏报数", s.iq.tabText==="I/Q 1" && /^1 段 · \d+(\.\d)? MB \/ 2000 MB$/.test(s.iq.sum) && s.iq.button==="立即录 I/Q", {tab:s.iq.tabText, sum:s.iq.sum});
 
 // ---- 回放 ----
 const f0 = s.audio.frames;
@@ -50,7 +50,7 @@ await ev('__act.sdr("replayIq", 0)');
 s = await until("replaying", async()=>{ const q=await sdr(); return q.replay && q.replay.name===cap.name && q.device.state==="ready" && q.air?.open && q.audio.frames>f0+40 ? q : null; }, 20000);
 check("点一段即回放：接收机换成这段录制", /^回放 · /.test(s.device.model) && s.mode==="air" && s.air.listenLabel==="118.500", s.device.model);
 check("状态条、标题、按钮都写明这是回放", /^回放 · 话音 · TWR 118\.500 · .*真接收机已释放$/.test(s.pill) && /replay/.test(s.pillClass) && s.pillBack==="返回实时" && s.dock.back==="返回实时" && /^回放 · 话音监听/.test(s.spectrum.title), {pill:s.pill, cls:s.pillClass});
-check("回放时没有「录 I/Q」按钮；列表里标出正在放的那段", !s.iq.buttonShown && s.iq.rows[0].icon==="■" && s.iq.rows[0].cur, s.iq.rows[0]);
+check("回放时没有「立即录 I/Q」按钮；列表里标出正在放的那段", !s.iq.buttonShown && s.iq.rows[0].icon==="■" && s.iq.rows[0].cur, s.iq.rows[0]);
 s = await until("replay tone", async()=>{ const q=await sdr(); return near(q.audio.hz, 1000, 60) && near(q.air.afc, -7000, 80) ? q : null; }, 10000);
 check("听到的是录下来的塔台：1 kHz，载波仍偏 −7 kHz", true, {hz:s.audio.hz, afc:s.air.afc});
 const n0 = s.spectrum.stats.rows; await sleep(1500); s = await sdr();
@@ -76,9 +76,11 @@ check("点「返回实时」：回到回放之前的模式，本地飞机回来"
 await ev('__act.sdr("listenRow", 11)');                  // 地面 121.9：说 2 秒停 5 秒
 await until("ground", async()=>{ const q=await sdr(); return q.mode==="air" && q.air?.listenLabel==="121.900"; }, 15000);
 await ev('__act.sdr("iqVoice", true)');
-s = await until("both on", async()=>{ const q=await sdr(); return q.iq.withVoice && q.rec.on ? q : null; }, 5000);
-check("勾上「连 I/Q」：录音也跟着打开", true);
-s = await until("voice iq", async()=>{ const q=await sdr(); return q.rec.count>=2 && q.iq.count>=3 && !q.iq.active ? q : null; }, 30000);
+s = await until("iq only", async()=>{ const q=await sdr(); return q.iq.withVoice && q.iq.count>=2 && !q.iq.active ? q : null; }, 30000);
+check("只勾「录 I/Q」不勾「录音」：有人说话照样自动存 I/Q，话音不存", s.rec.on===false && s.rec.count===0 && s.iq.list[0].kind==="voice" && s.rec.label==="录音" && !s.rec.live, {rec:s.rec.count, iq:s.iq.count});
+check("两个勾选框和按钮的名字不重样", await ev('[].map.call(document.querySelectorAll("#sdrDock .ctl .tog span"),function(e){return e.textContent}).join("|")')==="轮巡|无话音时静音|录音|录 I/Q" && s.iq.button==="立即录 I/Q", s.iq.button);
+await ev('__act.sdr("record", true)');
+s = await until("voice iq", async()=>{ const q=await sdr(); return q.rec.on && q.rec.count>=2 && q.iq.count>=4 && !q.iq.active && !q.rec.live ? q : null; }, 40000);
 const clip = s.rec.list[0], viq = s.iq.list.find(x => x.name===clip.iq);
 check("每段话音都有一段同时录下的 I/Q，开头不晚于话音、盖住整段", viq && viq.kind==="voice" && viq.listen==="121.900" && viq.duration_s>clip.duration_s-0.3 && viq.duration_s<clip.duration_s+2.5 && viq.start<clip.start+0.5, {clip:clip.duration_s, iq:viq?.duration_s});
 check("列表里标明是话音触发的", s.iq.rows.some(r => / · 话音触发$/.test(r.name)), s.iq.rows.map(r => r.name));
@@ -90,7 +92,7 @@ await ev('document.querySelector("#sdrPill .back").click()');
 await until("adsb", async()=>{ const q=await sdr(); return q.mode==="adsb" && q.adsb.state==="running"; }, 20000);
 await ev('__act.sdr("view", "half")');
 s = await until("adsb dock", async()=>{ const q=await sdr(); return q.dock.on && q.spectrum.mode==="adsb" && q.iq.shown ? q : null; }, 8000);
-check("ADS-B 模式下打开停靠栏：有「录 I/Q」，右侧能翻 I/Q", s.iq.buttonShown && s.iq.rows.length>=3, {rows:s.iq.rows.length});
+check("ADS-B 模式下打开停靠栏：有「立即录 I/Q」，右侧能翻 I/Q", s.iq.buttonShown && s.iq.rows.length>=3, {rows:s.iq.rows.length});
 const n1 = s.iq.count;
 await ev('__act.sdr("iq")'); await sleep(1500); await ev('__act.sdr("iq")');
 s = await until("adsb capture", async()=>{ const q=await sdr(); return q.iq.count===n1+1 && !q.iq.active ? q : null; }, 8000);

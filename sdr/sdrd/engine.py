@@ -107,7 +107,7 @@ class Engine:
                            float(cfg.get("rec_quota_mb") or 200) * 1e6, self._recordings_changed)
 
         # ---- 原始 I/Q 的录制与回放 ----
-        # 环形缓冲一直留着最近 1.5 秒的采样（只是引用，不拷贝）。按下「录 I/Q」或话音触发时
+        # 环形缓冲一直留着最近 1.5 秒的采样（只是引用，不拷贝）。按下「立即录 I/Q」或话音触发时
         # 把它放在最前面：等人反应过来去按的时候，想录的那一下往往已经过去了。
         self.iq = IqStore(os.path.join(run_dir, "iq"), float(cfg.get("iq_quota_mb") or 2000) * 1e6,
                           self._iqs_changed)
@@ -227,9 +227,11 @@ class Engine:
         if "iq_with_voice" in op:
             self.cfg.set(iq_with_voice=bool(op["iq_with_voice"]))
         if "record" in op:
+            if self.cfg.get("record") and not op["record"] and self.monitor:
+                self.monitor.end_clip("stopped")     # 正在录的这段先存下来，再关
             self.cfg.set(record=bool(op["record"]))
-            if self.monitor:
-                self.monitor.record = bool(op["record"])
+        if self.monitor:
+            self.monitor.record = self._triggering()
         if "patrol" in op:
             if not self.air:
                 return {"ok": False, "code": "no_channels", "msg": "还没选频道"}
@@ -363,7 +365,7 @@ class Engine:
         mon = Monitor(w["center_hz"], [self._channel(i) for i in w["ch"]],
                       self.cfg.get("squelch_db"), self._audio_out, bool(self.cfg.get("voice_only")),
                       self._clip_out, self.clip_s)
-        mon.record = bool(self.cfg.get("record"))
+        mon.record = self._triggering()
         mon.gen = self._gen
         if air["listen"] not in w["ch"]:
             air["listen"] = self._best_in(win)
@@ -379,15 +381,26 @@ class Engine:
         if mon:
             mon.end_clip()
 
+    def _triggering(self):
+        """话音触发要不要跑。「录音」和「录 I/Q」各自独立，开着任何一个都要：两者共用同一个触发。"""
+        return bool(self.cfg.get("record") or self.cfg.get("iq_with_voice"))
+
     def _clip_out(self, ch, clip):
-        """sdr-dsp 或引擎线程：录完一段。补上「这是哪个机场的哪个频道」，交给写盘线程。"""
+        """sdr-dsp 或引擎线程：一次通话结束了。开着「录音」就把这段话音交给写盘线程。
+
+        没开「录音」、只开了「录 I/Q」时也会走到这里：这一段话音本身不存，但它算数——
+        说明刚才那次触发是一次真的通话，对应的那段 I/Q 该留下。
+        """
+        cur = self.iq.active()
+        if cur and cur["kind"] == "voice":
+            self._iq_clip = True
+        if not self.cfg.get("record"):
+            return
         air = self.air or {}
         meta = {"hz": ch["hz"], "label": ch["label"], "type": ch["type"], "desc": ch["desc"],
                 "spacing": ch["spacing"], "airport": air.get("airport"), "airport_label": air.get("label") or ""}
-        cur = self.iq.active()
-        if cur and cur["kind"] == "voice":           # 同时在录这一段的 I/Q：两边互相指一下
+        if cur and cur["kind"] == "voice":           # 同时在录这一段的 I/Q：话音片段指过去
             meta["iq"] = cur["name"]
-            self._iq_clip = True
         if self._replay:
             meta["replay_of"] = self._replay["name"]   # 这段话音是从回放里录的，不是当时现场的
         self.store.add(clip, meta)
@@ -446,7 +459,7 @@ class Engine:
             elif not talking:
                 # 话音片段结束了。它要是被当成噪声丢掉了，这段 I/Q 也不留
                 self._iq_stop("clip", keep=self._iq_clip)
-        elif talking and self.cfg.get("iq_with_voice") and self.cfg.get("record") and self._rf == "air":
+        elif talking and self.cfg.get("iq_with_voice") and self._rf == "air":
             self._iq_start("voice")
 
     def _op_iq(self, op):
@@ -858,7 +871,7 @@ class Engine:
                 elif self.mode != "off" and not self.source and now >= self._retry_at:
                     self._open()
                 if self.mode == "air":               # 没人听了就倒计时，到点回去接着收 ADS-B
-                    if self.listeners > 0 or self.cfg.get("record"):     # 开着录音就是有事在做，不算没人听
+                    if self.listeners > 0 or self._triggering():         # 开着自动录制就是有事在做，不算没人听
                         self._idle_since = self._idle_left = None
                     else:
                         self._idle_since = self._idle_since or now

@@ -41,7 +41,7 @@ class Monitor:
         self.on_audio = on_audio
         self.on_clip = on_clip           # function(频道, 片段)：录完一段
         self.clip_s = clip_s             # 一段最长多少秒；None 用 record.MAX_S
-        self.record = False              # 录音开着没有，由引擎改
+        self.record = False              # 话音触发要不要跑（开着「录音」或「录 I/Q」），由引擎改
         self.spectrum = Spectrum()
         self.squelch = {c["id"]: Squelch(squelch_db) for c in self.channels}
         self.offset = {c["id"]: c["hz"] - center_hz for c in self.channels}

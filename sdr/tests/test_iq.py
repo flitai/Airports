@@ -280,8 +280,22 @@ class EngineIq(unittest.TestCase):
 
     def test_voice_triggered_iq_follows_the_audio_clips(self):
         self.cmd(op="channels", label="Test Field", airport=7, list=self.ROWS, pick=1)   # 地面：说 2 秒停 3 秒
-        self.assertTrue(self.cmd(op="set", record=True, iq_with_voice=True)["ok"])
         recs = lambda: self.eng.snapshot("recordings")
+        # 只开「录 I/Q」，不开「录音」：每次通话照样自动存一段 I/Q，话音一段也不存
+        self.eng.listeners = 0
+        self.eng.auto_return_s = 2
+        self.assertTrue(self.cmd(op="set", iq_with_voice=True)["ok"])
+        self.assertTrue(wait_for(lambda: self.iqs()["count"] >= 2, 20))
+        alone = self.iqs()["list"][0]
+        self.assertEqual((alone["kind"], alone["end"], alone["listen"]), ("voice", "clip", "121.900"))
+        self.assertTrue(3.0 <= alone["duration_s"] <= 5.5, alone["duration_s"])     # 2 秒通话，前有留白后有收尾
+        st = self.st()
+        self.assertEqual((recs()["count"], st["rec"]["on"], st["iq"]["with_voice"]), (0, False, True))
+        self.assertEqual((st["mode"], st["auto_return_s"]), ("air", None))          # 开着自动录 I/Q，同样不自动返回
+        self.eng.listeners, self.eng.auto_return_s = 1, 999
+        # 两个都开：话音片段指向同时录下的那段 I/Q
+        self.cmd(op="iq", clear=True)
+        self.assertTrue(self.cmd(op="set", record=True)["ok"])
         self.assertTrue(wait_for(lambda: recs()["count"] >= 2 and self.iqs()["count"] >= 2, 20))
         clip = recs()["list"][0]
         iq = next(i for i in self.iqs()["list"] if i["name"] == clip["iq"])        # 话音片段指向同时录下的那段 I/Q

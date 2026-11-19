@@ -298,8 +298,9 @@ function buildDock(){
   dkRecBox.title = "有人说话就自动存一段，一次通话一个文件。不必有页面在听；开着录音时接收机不会自动回到 ADS-B";
   // 原始 I/Q：接收机当时看到的整个窗口，原样存下来，之后可以回放、换着频道重听。每秒 4.8 MB
   dkIqVoice = document.createElement("input"); dkIqVoice.type = "checkbox";
-  var iqv = el("label", "f tog air"); iqv.append(dkIqVoice, el("span", null, "连 I/Q"));
-  iqv.title = "话音触发录音时，同时把那一段的整窗原始 I/Q 也存下来（每秒 4.8 MB，一次十秒的通话约 50 MB）";
+  var iqv = el("label", "f tog air"); iqv.append(dkIqVoice, el("span", null, "录 I/Q"));
+  iqv.title = "有人说话就自动存那一段的整窗原始 I/Q，之后可以回放（每秒 4.8 MB，一次十秒的通话约 50 MB）。" +
+              "和「录音」各管各的，可以只开一个";
   dkIq = el("button", "sdr-btn"); dkIq.type = "button";
   dkBack = el("button", "sdr-btn air"); dkBack.type = "button";
   // 直接输入频率：不在任何机场频率表里的也能去听，从 ADS-B 模式也能直接进话音
@@ -359,11 +360,7 @@ function buildDock(){
   tbRec.addEventListener("click", function(){ tbRec.blur(); sideTab = "rec"; renderSide(); });
   tbIq.addEventListener("click", function(){ tbIq.blur(); sideTab = "iq"; renderSide(); });
   dkIq.addEventListener("click", function(){ dkIq.blur(); send({ op:"iq", on:!(st && st.iq && st.iq.active) }); });
-  // 勾「连 I/Q」而录音没开，等于什么都不会录：顺手把录音也打开
-  dkIqVoice.addEventListener("change", function(){
-    send(dkIqVoice.checked ? { op:"set", iq_with_voice:true, record:true } : { op:"set", iq_with_voice:false });
-    dkIqVoice.blur();
-  });
+  dkIqVoice.addEventListener("change", function(){ send({ op:"set", iq_with_voice:dkIqVoice.checked }); dkIqVoice.blur(); });
   dkIqClr.addEventListener("click", function(){
     dkIqClr.blur();
     if (Date.now() < iqClearArmed){ iqClearArmed = 0; send({ op:"iq", clear:true }); }
@@ -718,7 +715,7 @@ function renderIqs(){
   for (var n in iqEls) if (!seen[n]){ iqEls[n].root.remove(); delete iqEls[n]; }
   dkIqSum.textContent = iqs.count
     ? iqs.count + " 段 · " + megabytes(iqs.bytes) + " / " + megabytes(iqs.quota_bytes)
-    : "还没有 I/Q。点标题行的「录 I/Q」录下当前整个窗口，之后可以回放";
+    : "还没有 I/Q。点标题行的「立即录 I/Q」录下当前整个窗口，或勾上「录 I/Q」让它在有人说话时自动录";
   dkIqSum.title = "超过上限时从最旧的删起";
   dkIqClr.style.display = iqs.count ? "" : "none";
   dkIqClr.textContent = Date.now() < iqClearArmed ? "再点一次确认" : "清空";
@@ -837,7 +834,8 @@ function renderDock(){
     if (document.activeElement !== dkVol) dkVol.value = Math.round(volume * 100);
     dkMute.textContent = muted ? "取消静音" : "静音";
     dkMute.classList.toggle("cur", muted);
-    var recS = chan ? chan.rec_s : null;             // 正在录的这段已经多长
+    // 正在录的这段话音已经多长。只开了「录 I/Q」时触发也在跑，但话音并不存，所以不算
+    var recS = chan && st.rec && st.rec.on ? chan.rec_s : null;
     dkRec.checked = !!(st.rec && st.rec.on);
     dkRecBox.classList.toggle("live", recS != null);
     dkRecTxt.textContent = recS != null ? "录音 " + minSec(recS) : "录音";
@@ -859,15 +857,15 @@ function renderDock(){
     dkNow.className = "now";
     dkNow.textContent = s && s.floorDb != null ? "底噪 " + String(s.floorDb.toFixed(0)).replace("-", "−") + " dBFS" : "";
   }
-  // 「录 I/Q」：正在录时变红，写明已经录了多久、多大；回放时没有它（录下来的只会是同一段）
+  // 「立即录 I/Q」：正在录时变红，写明已经录了多久、多大；回放时没有它（录下来的只会是同一段）
   var cap = mode && st.iq ? st.iq.active : null;
   dkIq.style.display = mode && st.iq && !st.replay ? "" : "none";
   dkIq.classList.toggle("rec-on", !!cap);
-  dkIq.textContent = cap ? "● I/Q " + minSec(cap.s) + " · " + megabytes(cap.bytes) : "录 I/Q";
+  dkIq.textContent = cap ? "● I/Q " + minSec(cap.s) + " · " + megabytes(cap.bytes) : "立即录 I/Q";
   dkIq.title = cap ? (cap.kind === "voice" ? "话音触发的这段正在录。点一下改为手动：由你来停" : "点一下停止") +
                      (cap.dropped ? " · 写盘跟不上，已丢 " + cap.dropped + " 块" : "")
-                   : "把接收机此刻看到的整个窗口原样录下来（每秒 4.8 MB），并带上按下之前的 1.5 秒。再点停止，最长 " +
-                     (st && st.iq ? st.iq.max_s : 60) + " 秒";
+                   : "现在就开始录，不等人说话：把接收机此刻看到的整个窗口原样录下来（每秒 4.8 MB），" +
+                     "并带上按下之前的 1.5 秒。再点停止，最长 " + (st && st.iq ? st.iq.max_s : 60) + " 秒";
   syncSpectrum();
   paintMarks();
   var sk = mode + v + (st && st.rec ? st.rec.on : "") + (st && st.replay ? st.replay.name : "");
@@ -905,6 +903,11 @@ function describe(){
           who + "ADS-B 1090 · " + a.ac + " 架 · " + a.msg_rate + " 条/秒" + warn];
 }
 
+function autoRec(){               // 开着哪种自动录制：写进提示里的名字；都没开是 ""
+  var a = !!(st && st.rec && st.rec.on), b = !!(st && st.iq && st.iq.with_voice);
+  return a && b ? "录音和录 I/Q" : (a ? "录音" : (b ? "录 I/Q" : ""));
+}
+
 // 话音模式下的状态条。本地 ADS-B 此时是停的，这件事每一种说法里都带着。
 function describeAir(){
   var air = st.air, tail = st.replay ? " · 真接收机已释放" : " · 本地 ADS-B 已暂停";
@@ -914,13 +917,13 @@ function describeAir(){
   }
   if (!air || !chan) return ["busy", (st.replay ? "回放 · " : "本地接收 · ") + "话音 · 正在调谐…"];
   if (!soundReady())
-    return [st.rec && st.rec.on ? "idle" : "warn", "话音 · " + (audioErr || "声音未开启，点下方「开启声音」") +
+    return [autoRec() ? "idle" : "warn", "话音 · " + (audioErr || "声音未开启，点下方「开启声音」") +
             (st.auto_return_s != null ? " · " + st.auto_return_s + " 秒后" + (st.return_to === "off" ? "关闭" : "回到 ADS-B")
-                                      : (st.rec && st.rec.on ? " · 录音开着，不会自动返回" : ""))];
+                                      : (autoRec() ? " · " + autoRec() + "开着，不会自动返回" : ""))];
   var now = nowLine(air), head = (st.replay ? "回放 · " : "本地接收 · ") + "话音 · ";
   if (air.patrol) head += "轮巡" + (air.windows.length > 1 ? " " + (chan.win + 1) + "/" + air.windows.length : "") + " · ";
   if (muted) tail = " · 已静音" + tail;
-  if (chan.rec_s != null) tail = " · 正在录音" + tail;
+  if (chan.rec_s != null && st.rec && st.rec.on) tail = " · 正在录音" + tail;
   if (st.audio.dsp_drops) tail += " · ⚠ 解调丢块 " + st.audio.dsp_drops;
   return [now[0] === "on" ? "ok" : "idle", head + now[1] + tail];
 }
