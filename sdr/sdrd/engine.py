@@ -9,6 +9,7 @@
 线程：
   rtl-usb / iq-*   采样源的回调，只调 _on_block
   adsb-pipe        往 readsb 写管道
+  vdl2-pipe / -out 重采样后往 dumpvdl2 写管道 / 读它解出的报文（见 vdl2.Dumpvdl2Decoder）
   sdr-dsp          话音模式下的频谱、静噪和解调（见 air.Monitor）；两种模式下瀑布图的行
   sdr-engine       本文件的 run()：处理命令、开关设备、调谐、轮巡、每秒读一次解码结果
   sdr-rec*         录音和原始 I/Q 的写盘、删除（见 record.Store / record.IqStore）
@@ -26,7 +27,7 @@ from concurrent.futures import Future
 
 import numpy as np
 
-from . import adsb
+from . import adsb, vdl2
 from .air import Monitor
 from .device import DeviceError
 from .dsp import candidates as cand
@@ -37,8 +38,9 @@ from .geo import RangeOutline
 from .record import IqStore, Store
 from .sources import ReplaySource, make_source
 
-MODES = ("off", "adsb", "air")       # scan 在后续里程碑加入
-RESTING = ("off", "adsb")            # 能写进设置、重启后接着干的模式；话音要有人在听才有意义
+MODES = ("off", "adsb", "air", "vdl2")   # scan 在后续里程碑加入
+RESTING = ("off", "adsb", "vdl2")    # 能写进设置、重启后接着干的模式；话音要有人在听才有意义
+AIRLIKE = ("air", "vdl2")            # 跑 Monitor 那条链的模式：数据链模式下同窗的话音照常监视
 RETRY_S = 2.0
 DWELL_S = 1.5                        # 轮巡：每个窗口至少看这么久
 HANG_S = 3.0                         # 轮巡：通话结束后再等这么久，回话多半就在这几秒里
@@ -87,7 +89,7 @@ class Engine:
         self.on_audio = None             # function(bytes)：一帧音频，由 sdr-dsp 线程调用
         self.listeners = 0               # 有几个页面在出声，由服务端维护
         self.auto_return_s = 60          # 没人听了，过这么久自动回到进话音之前的模式
-        self._rf = None                  # 接收机此刻实际在干什么：None / "adsb" / "air"
+        self._rf = None                  # 接收机此刻实际在干什么：None / "adsb" / "air" / "vdl2"
         self._gen = 0                    # 每次重调谐加一，采样块带着它排队
         self._dspq = queue.Queue(maxsize=32)         # 32 块约 0.44 秒
         self._dsp_drops = 0
@@ -130,13 +132,32 @@ class Engine:
         self._plain_rows = Rows(blocks=1)    # 那边是 6 块里抽 1 块，抽到的每块就是一行
         self._row_seq = 0
 
+        # ---- VDL2 数据链 ----
+        # 实时收到的和回放里解出的分开记：回放是循环播的，解码器打的又是当下的时间，
+        # 混在一起的话同一条报文每圈都多出一份，还会被当成刚收到的去给地图上的飞机打标。
+        self.vdl = None                  # 当前的 Dumpvdl2Decoder；只在数据链模式下有
+        self._vdl_state = "off"
+        self._vdl_error = None
+        self._vdl_retry = 1.0
+        self._vdl_at = 0.0
+        self._vdl_drops = 0              # 上一拍看到的丢样字节数；又涨了就是解码器此刻跟不上
+        self._vdl_lag_until = 0.0
+        self.vlog = vdl2.Log()
+        self.vlog_replay = vdl2.Log()
+        self.journal = vdl2.Journal(os.path.join(run_dir, "vdl2"), float(cfg.get("vdl2_log_mb") or 0) * 1e6)
+        for raw in self.journal.tail():  # 重启后把报文列表接回来
+            msg = vdl2.parse(raw)
+            if msg:
+                self.vlog.add(msg)
+
         self._snap = {"aircraft": {"t": "aircraft", "list": []},
                       "channels": {"t": "channels", "win": 0, "listen": None, "open": False,
                                    "voice": False, "level": {}, "active": [], "steady": []},
                       "candidates": {"t": "candidates", "list": []},
                       "recordings": dict(self.store.snapshot(), t="recordings"),
                       "iqs": dict(self.iq.snapshot(), t="iqs"),
-                      "outline": dict(self.outline.to_json(), t="outline")}
+                      "outline": dict(self.outline.to_json(), t="outline"),
+                      "vdl2": self._vdl_snap()}
         self._snap["status"] = self._status({})
 
     # ---- 对外接口（任何线程都可以调）----
@@ -167,7 +188,7 @@ class Engine:
             return {"ok": False, "code": "bad_mode", "msg": "这个模式尚未实现"}
         if mode == "off" and self._replay:   # 关闭就是关闭：回放也一并结束
             self._replay_stop()
-        if mode == "air" and not self.air:
+        if mode == "air" and not self._voice():      # 只有数据链频道的表不算：那上面没有话音可听
             return {"ok": False, "code": "no_channels",
                     "msg": "还没选频道：打开一个机场，在频率表里点「收听」"}
         self._set_mode(mode)
@@ -180,6 +201,10 @@ class Engine:
             self._idle_since = self._idle_left = None
         elif not self._replay:           # 回放时切的模式只是为了看那段录制，不是重启后要接着干的事
             self.cfg.set(mode=mode)
+        if mode not in AIRLIKE and self.air and len(self._voice()) != len(self.air["channels"]):
+            # 离开数据链去 ADS-B 或关闭：频道表里不留数据链频道。一个话音频道都没有，这张表就不要了
+            if not self._shape("air"):
+                self.air = None
         self.mode = mode
         self._retry_at = 0.0             # 用户刚点过，别让他等重试间隔
 
@@ -235,36 +260,89 @@ class Engine:
         if "patrol" in op:
             if not self.air:
                 return {"ok": False, "code": "no_channels", "msg": "还没选频道"}
+            if self.mode == "vdl2" and op["patrol"]:
+                return {"ok": False, "code": "no_patrol", "msg": "数据链模式下不轮巡：窗口一挪走，报文就断了"}
             self.air["patrol"] = bool(op["patrol"])
             self._hold_until = 0.0
         return {"ok": True}
 
     # ---- 话音：频道表、窗口、收听 ----
     def _set_plan(self, channels, pick, label="", airport=None, skipped=0):
-        """channels 是 dsp.channels.build 的结果，pick 是其中一个的 id（或 None）。"""
+        """channels 是 dsp.channels.build 的结果，pick 是其中一个的 id（或 None）。
+
+        所有改频道表的命令都走这里。数据链模式下多一条规则：要听的频道落在数据链
+        窗口里（或者没指定要听哪个），就留在数据链模式，只是换了一张话音频道表；
+        否则离开它去话音模式——回头没人听了，会自动回到数据链（_return_to）。
+        """
+        channels = [c for c in channels if not c.get("data")]
+        steady = self.air["steady"] if self.air else set()
+        # 常驻载波的频率。记在这儿而不是 Monitor 里：换窗口回来不必重新认一遍
+        keep = {c["hz"] for c in channels if c["hz"] in steady}
+        if self.mode == "vdl2":
+            both, windows = chan.plan_vdl2(channels)
+            if pick is None or pick in windows[0]["ch"]:
+                self.air = {"label": label, "airport": airport, "channels": both, "windows": windows,
+                            "win": 0, "listen": pick, "patrol": False, "skipped": skipped, "steady": keep}
+                if self._rf == "vdl2":   # 频道表变了，Monitor 要照新表重建；中心没变，解码器不动
+                    self._retune(0)
+                return
         at = next((k for k, c in enumerate(channels) if c["id"] == pick), None)
         windows = chan.plan(channels, at)
         win = channels[at]["win"] if at is not None else 0
-        steady = self.air["steady"] if self.air else set()
         self.air = {"label": label, "airport": airport, "channels": channels, "windows": windows,
-                    "win": win, "listen": pick, "patrol": False, "skipped": skipped,
-                    # 常驻载波的频率。记在这儿而不是 Monitor 里：换窗口回来不必重新认一遍
-                    "steady": {c["hz"] for c in channels if c["hz"] in steady}}
+                    "win": win, "listen": pick, "patrol": False, "skipped": skipped, "steady": keep}
         if pick is None:
             self.air["listen"] = self._best_in(win)
         self._set_mode("air")
-        if self._rf == "air":            # 已经在话音模式里：直接换过去，不必等下一拍
-            self._tune_window(win)
+        if self._airlike():              # 已经在话音那条链上：直接换过去，不必等下一拍
+            self._retune(win)
+
+    def _shape(self, want):
+        """把频道表整理成 want 这个模式要的样子 → 成不成。重复调用结果不变。
+
+        进入数据链模式的路不止一条——启动时读到存下的模式、切模式的命令、话音空闲
+        后自动返回、回放结束——它们都不经过 _set_plan。所以这件事放在 _sync_rf 里
+        统一做：凡是要调到一个话音类的模式上去，先过这里。
+        """
+        air = self.air or {"label": "", "airport": None, "channels": [], "listen": None, "skipped": 0,
+                           "steady": set(), "patrol": False}
+        voice = [c for c in air["channels"] if not c.get("data")]
+        if want == "vdl2":
+            both, windows = chan.plan_vdl2(voice)
+            listen = air["listen"] if air["listen"] in windows[0]["ch"] else None
+            self.air = dict(air, channels=both, windows=windows, win=0, listen=listen, patrol=False)
+            return True
+        if not voice:
+            return False
+        if len(voice) != len(air["channels"]):       # 表里还有数据链频道：拿掉，按正在听的那个重新分窗口
+            at = next((k for k, c in enumerate(voice) if c["id"] == air["listen"]), None)
+            windows = chan.plan(voice, at)
+            self.air = dict(air, channels=voice, windows=windows, win=voice[at]["win"] if at is not None else 0)
+            if at is None:
+                self.air["listen"] = self._best_in(0)
+        return True
+
+    def _airlike(self):
+        return self._rf in AIRLIKE
+
+    def _voice(self):
+        """频道表里的话音频道（不算数据链频道）。"""
+        return [c for c in self.air["channels"] if not c.get("data")] if self.air else []
 
     def _channel(self, ident):
         return next((c for c in self.air["channels"] if c["id"] == ident), None) if self.air else None
 
     def _best_in(self, win):
-        """这个窗口里默认听哪个：此刻有信号的优先，其次按权重，连续播发的排最后。"""
+        """这个窗口里默认听哪个：此刻有信号的优先，其次按权重，连续播发的排最后。
+
+        数据链频道不在候选里；窗口里没有话音频道就返回 None。
+        """
         ids = self.air["windows"][win]["ch"]
         mon = self.monitor if self.monitor and self.air["win"] == win else None
         live = lambda i: bool(mon and i in mon.squelch and mon.squelch[i].open)
-        chs = [self._channel(i) for i in ids]
+        chs = [c for c in (self._channel(i) for i in ids) if c and not c.get("data")]
+        if not chs:
+            return None
         return max(chs, key=lambda c: (live(c["id"]) and not c["cont"], not c["cont"], c["weight"], -c["hz"]))["id"]
 
     def _op_channels(self, op):
@@ -279,33 +357,59 @@ class Engine:
         self._set_plan(channels, pick, chan.label_of(op.get("label")), airport, len(rows) - sum(len(c["rows"]) for c in channels))
         return {"ok": True}
 
+    DATA_MSG = {"ok": False, "code": "data_channel",
+                "msg": "这是数据链频道，没有话音可听；解出的报文在右侧的「报文」页签里"}
+
     def _op_listen(self, op):
+        if self.mode == "vdl2" and self.air and "ch" in op and op["ch"] is None:
+            # 数据链模式下不听话音是常态：停止收听不等于离开这个模式
+            self.air["listen"] = None
+            if self.monitor:
+                self.monitor.listen(None)
+            return {"ok": True}
         ch = self._channel(op.get("ch"))
         if not ch:
             return {"ok": False, "code": "bad_channel", "msg": "没有这个频道"}
-        self.air["patrol"] = False       # 明确点了一个频道：就听它，不再自动跳
-        self.air["listen"] = ch["id"]
+        if ch.get("data"):
+            return self.DATA_MSG
+        air = self.air
+        if self.mode == "vdl2":
+            if ch["win"] != 0:           # 窗外的频道：离开数据链去听它。窗口要重新分，所以走 _set_plan
+                self._set_plan(air["channels"], ch["id"], air["label"], air["airport"], air["skipped"])
+                return {"ok": True}
+            air["listen"] = ch["id"]     # 同窗的：只是多听一个话音频道，报文照收
+            if self._rf == "vdl2" and self.monitor:
+                self.monitor.listen(ch["id"])
+                self._listen_at = time.monotonic()
+            return {"ok": True}
+        air["patrol"] = False            # 明确点了一个频道：就听它，不再自动跳
+        air["listen"] = ch["id"]
         self._set_mode("air")
         if self._rf == "air":
-            if ch["win"] != self.air["win"] or not self.monitor:
-                self._tune_window(ch["win"])
+            if ch["win"] != air["win"] or not self.monitor:
+                self._retune(ch["win"])
             else:
                 self.monitor.listen(ch["id"])
                 self._listen_at = time.monotonic()
         else:
-            self.air["win"] = ch["win"]
+            air["win"] = ch["win"]
         return {"ok": True}
 
     def _op_window(self, op):
         i = op.get("i")
         if not self.air or isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < len(self.air["windows"]):
             return {"ok": False, "code": "bad_window", "msg": "没有这个窗口"}
-        self.air["patrol"] = False
-        self.air["win"] = i
-        self.air["listen"] = self._best_in(i)
+        air = self.air
+        if self.mode == "vdl2":
+            if i:                        # 别的窗口：离开数据链。窗口号在重新划分后不成立，换成「听它里面最好的那个」
+                self._set_plan(air["channels"], self._best_in(i), air["label"], air["airport"], air["skipped"])
+            return {"ok": True}
+        air["patrol"] = False
+        air["win"] = i
+        air["listen"] = self._best_in(i)
         self._set_mode("air")
         if self._rf == "air":
-            self._tune_window(i)
+            self._retune(i)
         return {"ok": True}
 
     def _op_tune(self, op):
@@ -321,8 +425,10 @@ class Engine:
         if not chan.AIR_LO <= hz <= chan.AIR_HI:
             return {"ok": False, "code": "bad_tune", "msg": "超出民航话音波段（118–137 MHz）"}
         self._manual_id += 1
-        kept = [c for c in self.air["channels"] if not c.get("manual")] if self.air else []
+        kept = [c for c in self._voice() if not c.get("manual")]
         new = chan.manual(hz, self._manual_id)
+        if self.mode == "vdl2" and new["hz"] in chan.VDL2_FREQS:
+            return self.DATA_MSG
         same = next((c for c in kept if c["hz"] == new["hz"]), None)     # 挪到了表里已有的频道上
         air = self.air or {}
         self._set_plan(kept if same else kept + [new], (same or new)["id"],
@@ -335,8 +441,8 @@ class Engine:
         if not ch or not ch.get("manual"):
             return {"ok": False, "code": "bad_channel", "msg": "只有手动调出来的频道可以删除"}
         air = self.air
-        kept = [c for c in air["channels"] if not c.get("manual")]
-        if not kept:                     # 频道表里只有它：没什么可听的了，回到进话音之前的模式
+        kept = [c for c in self._voice() if not c.get("manual")]
+        if not kept and self.mode != "vdl2":         # 频道表里只有它：没什么可听的了，回到进话音之前的模式
             self.air = None
             if self.mode == "air":
                 self._set_mode(self._return_to)
@@ -345,7 +451,7 @@ class Engine:
         # 正在听的不是它就接着听原来的；正在听的就是它，则由 _set_plan 另挑一个
         self._set_plan(kept, air["listen"] if air["listen"] != ch["id"] else None,
                        air["label"], air["airport"], air["skipped"])
-        self.air["patrol"] = patrol      # 删一个频道不该顺手把轮巡关了
+        self.air["patrol"] = patrol and self.mode == "air"       # 删一个频道不该顺手把轮巡关了
         if mode != "air":                # 不在话音模式时只是整理频道表，不借机切进去
             self._set_mode(mode)
         return {"ok": True}
@@ -358,7 +464,10 @@ class Engine:
         self._drop_monitor()
         self._iq_stop("retune")          # 一段 I/Q 只有一个中心频率
         try:
-            src.tune(w["center_hz"])
+            # 数据链窗口的中心是固定的：频道表变了要重建 Monitor，但不必再动一次硬件——
+            # 重设一遍锁相环会让解码器丢掉正在收的那个突发
+            if not (w.get("data") and src.center == w["center_hz"]):
+                src.tune(w["center_hz"])
         except DeviceError as e:
             self.error, self._lost = str(e), True
             return
@@ -368,12 +477,19 @@ class Engine:
         mon.record = self._triggering()
         mon.gen = self._gen
         if air["listen"] not in w["ch"]:
-            air["listen"] = self._best_in(win)
+            # 数据链窗口默认不听话音：进这个模式是为了收报文，要听哪个由人去点
+            air["listen"] = None if w.get("data") else self._best_in(win)
         mon.listen(air["listen"])
         air["win"] = win
         self.monitor = mon
         self._tuned_at = self._listen_at = time.monotonic()
         self._hold_until = 0.0
+
+    def _retune(self, win):
+        """调到第 win 个窗口，并让 _rf 和数据链解码器都跟上。已经在话音那条链上时用它直接换。"""
+        self._rf = self.mode
+        self._tune_window(win)
+        self._sync_vdl()
 
     def _drop_monitor(self):
         """不再用当前这个 Monitor 了。它正在录的那段先收尾交出去，别丢。"""
@@ -425,9 +541,9 @@ class Engine:
     def _iq_start(self, kind):
         """开录当前整窗的 I/Q。kind：manual（按了按钮）或 voice（跟着话音触发）。"""
         src = self.source
-        if not src or self._replay or self._rf not in ("adsb", "air") or self.iq.active():
+        if not src or self._replay or self._rf not in ("adsb",) + AIRLIKE or self.iq.active():
             return False
-        air = self.air if self._rf == "air" else None
+        air = self.air if self._airlike() else None
         meta = {"kind": kind, "mode": self._rf, "center_hz": src.center, "rate_hz": adsb.RATE, "gain_db": src.gain,
                 "device": self.device.get("model", "")}
         if air:
@@ -435,7 +551,7 @@ class Engine:
             listen = self._channel(air["listen"])
             # 每个频道连同它对应频率表的哪几行一起记下：页面靠行号把指示灯点回频率表上
             meta.update(airport=air["airport"], airport_label=air["label"], listen=listen and listen["label"],
-                        channels=[[c["type"], c["desc"], c["label"], c["rows"]] for c in air["channels"]])
+                        channels=[[c["type"], c["desc"], c["label"], c["rows"]] for c in self._voice()])
         with self._iq_lock:
             pre = [b for g, b in self._ring if g == self._gen]   # 只要这次调谐之后的：之前的是别的频率
             self._iq_clip = False
@@ -459,7 +575,7 @@ class Engine:
             elif not talking:
                 # 话音片段结束了。它要是被当成噪声丢掉了，这段 I/Q 也不留
                 self._iq_stop("clip", keep=self._iq_clip)
-        elif talking and self.cfg.get("iq_with_voice") and self._rf == "air":
+        elif talking and self.cfg.get("iq_with_voice") and self._airlike():
             self._iq_start("voice")
 
     def _op_iq(self, op):
@@ -505,15 +621,21 @@ class Engine:
             self._replay_prev = self.mode if self.mode in RESTING else self._return_to
         self._close("released")                      # 放开真接收机；正在录的 I/Q 也就此收尾
         self._replay = dict(item, path=path)
+        self._replay_changed()
         self.mode = "adsb"
         saved = item.get("channels") or []
-        channels = chan.build(saved) if item.get("mode") == "air" else []
+        channels = chan.build(saved) if item.get("mode") in AIRLIKE else []
         if len(channels) == len(saved):              # 一一对应（存的时候就是一个载波一条）：把行号摆回去
             for c, row in zip(channels, saved):
                 c["rows"] = list(row[3]) if len(row) > 3 and isinstance(row[3], list) else []
                 if not c["rows"]:
                     c["manual"] = True               # 没有行号的是当时手动调出来的
-        if channels:
+        if item.get("mode") == "vdl2":               # 数据链模式下录的：回到那个模式，解码器照常跑
+            self.mode, self.air = "vdl2", None
+            pick = next((c["id"] for c in channels if c["label"] == item.get("listen")), None)
+            self._set_plan(channels, pick, item.get("airport_label") or "", item.get("airport"))
+            self._return_to = "vdl2"
+        elif channels:
             pick = next((c["id"] for c in channels if c["label"] == item.get("listen")), None)
             self._set_plan(channels, pick, item.get("airport_label") or "", item.get("airport"))
             self._return_to = "adsb"
@@ -528,9 +650,117 @@ class Engine:
         """回到实时接收：放开回放文件，按原来的模式重新打开真接收机。"""
         self._close("released")
         self._replay = self._replay_alone = None
+        self._replay_changed()
         self.mode = self._replay_prev
         self._idle_since = self._idle_left = None
         self._retry_at = 0.0
+
+    def _replay_changed(self):
+        """回放开始或结束：回放里解出的报文另记一份，换过来；之前那一份清掉。"""
+        self.vlog_replay.clear()
+        self._publish(vdl2=self._vdl_snap())
+
+    # ---- VDL2 数据链 ----
+    def _sync_vdl(self):
+        """对账：解码器该不该在跑、跑的是不是当前这个中心。该换就换，不等旧的退出。
+
+        中心取自 Monitor 而不是窗口表：调谐失败时没有 Monitor，也就什么都不启动。
+        dumpvdl2 在显式给了中心频率时不做任何检查，喂错了窗口它照样「运行」。
+        """
+        mon, dec = self.monitor, self.vdl
+        want = self._rf == "vdl2" and mon is not None
+        if dec and not (want and dec.center == mon.center):
+            dec.stop(wait=False)
+            self.vdl = dec = None
+        if not want:
+            self._vdl_state = "off"
+        elif dec is None:
+            self._start_vdl(mon.center)
+            if self._vdl_state != "no_dumpvdl2":
+                self._vdl_state = "starting" if self.vdl.alive() else "failed"
+
+    def _start_vdl(self, center):
+        dec = self.vdl = vdl2.Dumpvdl2Decoder(self.run_dir, center, chan.VDL2_FREQS)
+        if not dec.available:
+            self._vdl_state = "no_dumpvdl2"          # 没编译 dumpvdl2：界面给出怎么装
+            return
+        self._vdl_error = None
+        try:
+            dec.start()
+        except (OSError, ValueError) as e:
+            self._vdl_error = str(e)
+
+    def _poll_vdl(self, now):
+        """每秒一次：解码器自己死了就按退避重启（计数与 readsb 的分开）。"""
+        dec = self.vdl
+        if not dec or not dec.available:
+            return
+        if not dec.alive():
+            self._vdl_state = "failed"
+            if now >= self._vdl_at:
+                self._vdl_at = now + self._vdl_retry
+                self._vdl_retry = min(30.0, self._vdl_retry * 2)
+                err = dec.last_error()
+                dec.stop(wait=False)
+                self._start_vdl(dec.center)
+                self._vdl_error = self._vdl_error or err
+            return
+        if dec.dropped != self._vdl_drops:
+            # 丢样数是累计的。刚启动那一下可能丢几块（进程还没开始读），之后不涨就不是问题；
+            # 界面上的告警只看「最近几秒还在不在丢」
+            if dec.dropped > self._vdl_drops:
+                self._vdl_lag_until = now + 5
+            self._vdl_drops = dec.dropped
+        up = time.time() - dec.started
+        if up >= 1:                      # 它在解出第一条报文之前什么都不说；活过一秒就算起来了
+            self._vdl_state, self._vdl_error = "running", None
+        if up > 10:
+            self._vdl_retry = 1.0
+
+    def _vdl_tick(self, now):
+        """每 0.2 秒一次：把解码器新吐出来的报文收进来，实时的顺手写日志。"""
+        dec = self.vdl
+        rows = dec.take() if dec else []
+        if not rows:
+            return
+        log, fresh = (self.vlog_replay if self._replay else self.vlog), False
+        for raw in rows:
+            msg = vdl2.parse(raw)
+            if msg:
+                if self._replay:
+                    msg["replay"] = True
+                log.add(msg)
+                fresh = True
+        if not self._replay:
+            self.journal.write(rows)
+        if fresh:
+            self._publish(vdl2=self._vdl_snap())
+
+    def _vdl_snap(self):
+        log = self.vlog_replay if self._replay else self.vlog
+        return dict(log.snapshot(time.time()), t="vdl2", replay=bool(self._replay))
+
+    def _vdl_status(self):
+        dec = self.vdl
+        s = (self.vlog_replay if self._replay else self.vlog).stats(time.time())
+        on = self.mode == "vdl2" and self.source is not None
+        return {"state": self._vdl_state if on else "off", "center_hz": chan.VDL2_CENTER,
+                "freqs": [dict(s["freqs"].get(hz, {"n": 0, "last": None}), hz=hz) for hz in chan.VDL2_FREQS],
+                "total": s["total"], "per_min": s["per_min"], "ac": s["ac"],
+                "pipe_drops": dec.dropped if dec else 0,
+                "lagging": bool(dec) and time.monotonic() < self._vdl_lag_until,
+                "error": self._vdl_error if on and self._vdl_state == "failed" else None,
+                "log": self.journal.stats()}
+
+    def _op_vdl2(self, op):
+        """清空报文：内存里的和磁盘上的日志一起。"""
+        if op.get("clear") is not True:
+            return {"ok": False, "code": "bad_op", "msg": "不认识的命令"}
+        self.vlog.clear()
+        self.vlog_replay.clear()
+        self.journal.clear()
+        self._publish(vdl2=self._vdl_snap())
+        return {"ok": True}
 
     def _audio_out(self, frame):
         self._frames += 1
@@ -561,7 +791,7 @@ class Engine:
     def _air_tick(self, now):
         """每 0.2 秒一次：轮巡，并把各频道的电平推给页面。"""
         mon = self.monitor
-        if self._rf != "air" or not mon:
+        if not self._airlike() or not mon:
             return
         # 常驻载波：一直亮着不灭的。室内常见，是电脑、电源、网口时钟的杂散，不是通话。
         # 灭过一次就摘掉这个标记。通播本来就该一直亮，不算。
@@ -579,7 +809,7 @@ class Engine:
             elif c["id"] == self.air["listen"] and min(lit, now - self._listen_at) >= SILENT_S \
                     and (mon.voice_at is None or now - mon.voice_at >= SILENT_S):
                 steady.add(c["hz"])
-        if self.air["patrol"]:
+        if self.air["patrol"] and self.mode == "air":
             self._patrol(now, mon)
             mon = self.monitor or mon
         self._publish(channels=dict(mon.snapshot(), t="channels", win=self.air["win"],
@@ -627,7 +857,7 @@ class Engine:
 
     OPS = {"mode": _op_mode, "home": _op_home, "set": _op_set, "channels": _op_channels,
            "listen": _op_listen, "window": _op_window, "tune": _op_tune, "drop": _op_drop,
-           "record": _op_record, "iq": _op_iq, "replay": _op_replay}
+           "record": _op_record, "iq": _op_iq, "replay": _op_replay, "vdl2": _op_vdl2}
 
     # ---- 采样块入口（采样源线程）----
     def _on_block(self, block):
@@ -647,9 +877,13 @@ class Engine:
                     self._dspq.put_nowait((rf, self._gen, block))
                 except queue.Full:       # 只是少画一行，不值得上报
                     pass
-        elif rf == "air":
+        elif rf == "air" or rf == "vdl2":
+            if rf == "vdl2":
+                vdl = self.vdl
+                if vdl is not None:
+                    vdl.feed(block)
             try:
-                self._dspq.put_nowait((rf, self._gen, block))
+                self._dspq.put_nowait(("air", self._gen, block))     # Monitor 那条链不分这两种模式
             except queue.Full:           # 解调跟不上了：丢块并如实上报，绝不堵 USB 回调
                 self._dsp_drops += 1
         if self._blocks & 7 == 0:        # 每 8 块抽一块算削顶，约 9 次/秒，开销可忽略
@@ -698,12 +932,17 @@ class Engine:
         want = self.mode
         if want == self._rf or want == "off":
             return
+        if want in AIRLIKE and not self._shape(want):
+            # 要去话音却没有话音频道可听：回到来的地方
+            self._set_mode(self._return_to if self._return_to in RESTING else "adsb")
+            return
         if self._rf == "adsb" and self.decoder:
             self.decoder.stop(wait=False)
             self.decoder = None
             self._publish(aircraft={"t": "aircraft", "list": []})
         self._rf = None
         self._drop_monitor()
+        self._sync_vdl()
         self._iq_stop("retune")
         if want == "adsb":
             self._gen += 1               # 作废排队中的旧块，见 _tune_window
@@ -716,8 +955,7 @@ class Engine:
             self._start_decoder()
             self._rf = "adsb"
         else:
-            self._rf = "air"
-            self._tune_window(self.air["win"])
+            self._retune(self.air["win"])
 
     def _start_decoder(self):
         self.decoder = adsb.ReadsbDecoder(self.run_dir, self.home)
@@ -735,6 +973,7 @@ class Engine:
             self.decoder = None
         self._rf = None
         self._drop_monitor()
+        self._sync_vdl()
         self.device = dict(self.device, state=state)
         self._publish(aircraft={"t": "aircraft", "list": []})
 
@@ -809,7 +1048,8 @@ class Engine:
         air = None
         if self.air:
             air = {k: self.air[k] for k in ("label", "airport", "windows", "win", "listen", "patrol", "skipped")}
-            air["channels"] = [{k: c[k] for k in ("id", "type", "desc", "label", "hz", "spacing", "win", "rows", "cont")}
+            air["channels"] = [dict({k: c[k] for k in ("id", "type", "desc", "label", "hz", "spacing", "win", "rows",
+                                                       "cont")}, data=c.get("data"))
                                for c in self.air["channels"]]
         rf = None
         if src:
@@ -827,6 +1067,7 @@ class Engine:
                            max_s=float(self.cfg.get("iq_max_s") or 60), active=self.iq.active()),
                 "replay": {k: self._replay.get(k) for k in ("name", "center_hz", "duration_s", "mode", "airport_label",
                                                             "start")} if self._replay else None,
+                "vdl2": self._vdl_status(),
                 "return_to": self._return_to,
                 "auto_return_s": self._idle_left if self.mode == "air" else None,
                 "warnings": warnings}
@@ -856,6 +1097,7 @@ class Engine:
                 if now < next_tick:
                     self._air_tick(now)
                     self._iq_tick(now)
+                    self._vdl_tick(now)
                     continue
                 next_tick = now + 1.0
                 if self._lost and self.source:       # 被拔掉了
@@ -892,7 +1134,9 @@ class Engine:
                     if self._rf == "adsb":
                         part = self._poll_decoder(now)
                     self._air_tick(now)
-                    if self._rf == "air":
+                    self._poll_vdl(now)
+                    self._vdl_tick(now)
+                    if self._airlike():
                         self._publish(candidates={"t": "candidates", "list": self._candidates(now)})
                 self._publish(status=self._status(part))
         finally:

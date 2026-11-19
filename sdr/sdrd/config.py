@@ -24,6 +24,7 @@ DEFAULTS = {
     "iq_with_voice": False,  # 有人说话时自动存那一段的整窗原始 I/Q（每秒 4.8 MB）。与 record 各自独立
     "iq_quota_mb": 2000,     # 原始 I/Q 目录的总大小上限。2 GB 约合 7 分钟
     "iq_max_s": 60,          # 手动录 I/Q 一段最长多少秒，到了自动停
+    "vdl2_log_mb": 50,       # VDL2 报文日志（.runtime/vdl2/*.jsonl）的总大小上限，超了删最旧的；0 表示不落盘
 }
 
 

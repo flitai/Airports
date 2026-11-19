@@ -31,9 +31,11 @@ regions.csv
 #             源码（其中 tools/tetra-reference 是 AGPL）。移植进 sdr/ 的模块
 #             逐个注明来源后才入库，原件整体不入库。
 #   .runtime/ 守护进程的运行期状态，含接收机位置这类个人信息。
+#   sdr/.vdl2/ sdr/tools/build-dumpvdl2.sh 编出来的 VDL2 解码器（dumpvdl2 和 libacars）。
 # ---------------------------------------------------------------
 SDR-Lab/
 .runtime/
+sdr/.vdl2/
 node_modules/
 desktop/dist/
 

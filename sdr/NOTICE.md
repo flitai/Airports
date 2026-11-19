@@ -35,3 +35,10 @@ SDR Lab 作者：superbug。
 
 `sdrd/synth.py` 的报文编码依据 RTCA DO-260 的 1090ES 格式自行实现；
 `tests/test_synth.py` 中的两条示例报文出自 Junzi Sun《The 1090 Megahertz Riddle》。
+
+VDL2 数据链的解码由 [dumpvdl2](https://github.com/szpajder/dumpvdl2)（Tomasz Lemiech，GPL-3.0-or-later）承担，
+它依赖同一作者的 [libacars](https://github.com/szpajder/libacars)（MIT）。两者都是外部程序：不随本仓库分发，
+由 `tools/build-dumpvdl2.sh` 在使用者的机器上按固定版本取源码编译，守护进程把它当子进程来用（`sdrd/vdl2.py`）。
+合成信号源里的 VDL2 波形（`sdrd/synth.py` 的 `Vdl2Model`）用的是 dumpvdl2 源码自带的模型信号
+`test/vdl2_model_16b_1050kHz.wav`，同样只在编译时留一份在本机，不入库；`tests/fake_dumpvdl2.py` 里
+X.25 那条样例报文是 dumpvdl2 解这段模型信号的输出。

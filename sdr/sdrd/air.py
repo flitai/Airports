@@ -134,6 +134,8 @@ class Monitor:
             if tuned and i == tuned[0]:
                 gate = is_open and present
         if not tuned:
+            if self.talking is not None:
+                self._flush()            # 刚停止收听：没发完的那一小截音频发掉，别留到下次
             return
         ident, demod, detector, clipper = tuned
         pcm = demod.process(x, gate)

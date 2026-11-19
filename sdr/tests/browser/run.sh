@@ -1,6 +1,6 @@
 #!/bin/zsh
 # 浏览器端验收：用无头 Chrome 驱动真实页面，经 window.__probe / __act 断言。
-# 用法：sdr/tests/browser/run.sh [base|receiver|voice|spectrum|record|iq|all]      （默认 all）
+# 用法：sdr/tests/browser/run.sh [base|receiver|voice|spectrum|record|iq|vdl2|all]      （默认 all）
 #
 #   base      不启用接收机：联网航班、多来源合并、切底图；以及 file:// 模式
 #   receiver  用合成 ADS-B 信号走完整链路：serve.py → sdrd → readsb → 页面
@@ -8,6 +8,8 @@
 #   spectrum  频谱与瀑布图：两种模式下的行速率、点击调谐、信号列表
 #   record    话音触发录音：自动存片段、回放、删除，干扰载波不录
 #   iq        原始 I/Q：手动录、跟着话音触发录、在界面里回放、返回实时
+#   vdl2      VDL2 数据链：进出这个模式、报文列表、对到地图上的飞机、同窗话音。
+#             解码器用假的（sdr/tests/fake_dumpvdl2.py），不必编译 dumpvdl2
 #
 # 除 base 外各组都会改接收机位置、静噪这些设置（record 还会写录音），所以各用一个临时的运行目录，
 # 不碰 .runtime/sdr.json 里你自己的设置。
@@ -85,5 +87,20 @@ if [[ $WHAT == iq || $WHAT == all ]]; then
   serve --sdr; chrome
   node "$HERE/iq.mjs" $DBG "http://localhost:$PORT/" || RC=1
   stop
+fi
+if [[ $WHAT == vdl2 || $WHAT == all ]]; then
+  echo "===== VDL2 数据链 · 合成信号 + 假解码器 ====="
+  # 多一个 135.9（连续，600 Hz）：它落在数据链窗口里，用来验「同窗口的话音照常能听」
+  export SDR_SOURCE="$SYNTH,135.9*600" AIRPORTS_RUNTIME="$TMP/runtime-vdl2" SDR_AUTO_RETURN_S=600
+  export SDR_DUMPVDL2="$ROOT/sdr/tests/fake_dumpvdl2.py"
+  serve --sdr; chrome
+  node "$HERE/vdl2.mjs" $DBG "http://localhost:$PORT/" || RC=1
+  stop
+  echo "===== VDL2 数据链 · 没有解码器 ====="
+  export AIRPORTS_RUNTIME="$TMP/runtime-vdl2-none" SDR_DUMPVDL2=none
+  serve --sdr; chrome
+  node "$HERE/vdl2.mjs" $DBG "http://localhost:$PORT/" nodecoder || RC=1
+  stop
+  unset SDR_DUMPVDL2
 fi
 exit $RC

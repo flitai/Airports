@@ -25,6 +25,18 @@ var chan = null;                  // 最近一份 channels 快照：各频道电
 var cands = [];                   // 最近一份 candidates 快照：窗口里强到能开静噪的载波
 var recs = { list:[], count:0, bytes:0, quota_bytes:0 };   // 最近一份 recordings 快照：存下的录音片段
 var iqs = { list:[], count:0, bytes:0, quota_bytes:0 };    // 最近一份 iqs 快照：存下的原始 I/Q
+var vd = { seq:0, list:[], ac:[], replay:false };          // 最近一份 vdl2 快照：解出的数据链报文
+var modes = [];                   // 守护进程会的模式，hello 里给的。没有 vdl2 的是还没重启过的旧进程
+var lastMode = null;
+
+function airLike(){ return !!st && (st.mode === "air" || st.mode === "vdl2"); }   // 跑话音那条链的两种模式
+function inVdl(){ return !!st && st.mode === "vdl2"; }
+function vdlAvail(){ return modes.indexOf("vdl2") >= 0; }
+function chById(id){
+  var a = st && st.air;
+  if (a) for (var k=0;k<a.channels.length;k++) if (a.channels[k].id === id) return a.channels[k];
+  return null;
+}
 
 // ---------- 连接 ----------
 // 先问 serve.py 守护进程在哪个端口。首次启用时它可能还在装依赖，没端口就过会儿再问。
@@ -54,7 +66,9 @@ function connect(){
     else if (m.t === "candidates"){ cands = m.list || []; renderSignals(); paintMarks(); }
     else if (m.t === "recordings"){ recs = m; renderSide(); }
     else if (m.t === "iqs"){ iqs = m; renderSide(); }
+    else if (m.t === "vdl2"){ vd = m; onVdl2(); }
     else if (m.t === "hello"){
+      modes = m.modes || [];
       // 带 spectrum 的才是会发频谱的守护进程。页面文件改了一刷新就生效，守护进程却要
       // 重启才换新：两边版本对不上时如实说明，别对着一个不认识这条命令的进程空等
       specAvail = !!m.spectrum;
@@ -64,6 +78,8 @@ function connect(){
   };
   ws.onclose = function(){
     ws = null; link = "connecting"; linkWhy = ""; st = null; chan = null; cands = [];
+    vd = { seq:0, list:[], ac:[], replay:false }; modes = []; lastMode = null;
+    onVdl2();                             // 报文和飞机上的标记都是那个连接给的，断了就不作数
     stopClip();
     audioOn = specOn = specAvail = false; // 新连接默认不要声音也不要频谱，连上后各自重新申请
     onAircraft([]);                       // 连不上就别让旧飞机挂在图上装作还在收
@@ -96,6 +112,11 @@ function onAircraft(list){
 }
 
 function onStatus(){
+  if (st.mode !== lastMode){              // 刚进数据链模式：右侧栏翻到「报文」那一页
+    if (st.mode === "vdl2") sideTab = "msg";
+    lastMode = st.mode;
+  }
+  syncTags();                             // 标记会过期，而报文快照只在有新报文时才来
   app.ac.show("local", st.mode === "adsb");
   if (!volTouched) volume = st.volume == null ? volume : st.volume;
   syncAudio();
@@ -139,7 +160,7 @@ function audioStart(){                    // 必须从点击或按键的处理�
 function syncAudio(){
   // 回放录音时现场的声音先让一让，放完自己回来
   if (gainNode) gainNode.gain.value = muted || (playing && playing.audio) ? 0 : volume;
-  var want = soundReady() && !!st && st.mode === "air";
+  var want = soundReady() && airLike();
   if (want !== audioOn && send({ op:"audio", on:want })){
     audioOn = want;
     if (!want && node) node.port.postMessage({ reset:true });
@@ -213,7 +234,7 @@ function listenRow(i){
   var ap = rowsUI.ap; if (!ap || link !== "up" || !st) return;
   audioStart();
   var air = planFor(ap), ch = air && channelOfRow(air, i);
-  if (ch && st.mode === "air" && chan && chan.listen === ch.id){ leaveAir(); return; }   // 再点一次即停
+  if (ch && airLike() && chan && chan.listen === ch.id){ stopListening(); return; }   // 再点一次即停
   if (ch) send({ op:"listen", ch:ch.id });
   else send({ op:"channels", label:ap.label, airport:ap.id, list:ap.list, pick:i });
 }
@@ -223,10 +244,23 @@ function leaveAir(){
   if (st && st.replay) send({ op:"replay", off:true });
   else if (st) send({ op:"mode", mode:st.return_to || "adsb" });
 }
+// 不听了。话音模式下这就是离开；数据链模式下只是把话音停掉，报文照收
+function stopListening(){
+  if (inVdl()) send({ op:"listen", ch:null });
+  else leaveAir();
+}
+function backLabel(short){        // 「返回」按钮上写什么：看当初是从哪个模式进的话音
+  var r = st ? st.return_to : "adsb";
+  return r === "off" ? (short ? "停止" : "停止并释放设备") : (r === "vdl2" ? "返回 VDL2" : "返回 ADS-B");
+}
+function backWhere(short){
+  var r = st ? st.return_to : "adsb";
+  return r === "off" ? (short ? "关闭" : "关闭接收机") : (r === "vdl2" ? "回到 VDL2" : "回到 ADS-B");
+}
 
 function lamp(dot, ch){                   // 指示灯：亮 = 此刻有载波；空心 = 常驻载波；暗 = 不在当前窗口
   var cls = "sdr-dot", tip = "";
-  if (!ch || !chan || !st || st.mode !== "air"){ dot.className = cls; dot.title = ""; return; }
+  if (!ch || !chan || !airLike()){ dot.className = cls; dot.title = ""; return; }
   if (ch.win !== chan.win){ cls += " far"; tip = "不在当前窗口，点一下切过去"; }
   else if (chan.steady.indexOf(ch.id) >= 0){ cls += " steady"; tip = "一直亮着不灭：持续播发的台，或者干扰载波"; }
   else if (chan.active.indexOf(ch.id) >= 0){ cls += " on"; tip = "有信号"; }
@@ -235,7 +269,7 @@ function lamp(dot, ch){                   // 指示灯：亮 = 此刻有载波�
 }
 
 function paintRows(){
-  var air = planFor(rowsUI.ap), listening = air && st.mode === "air";
+  var air = planFor(rowsUI.ap), listening = air && airLike();
   for (var i=0;i<rowsUI.items.length;i++){
     var it = rowsUI.items[i]; if (!it.ok) continue;
     var ch = air && channelOfRow(air, i), mine = !!(listening && ch && chan && chan.listen === ch.id);
@@ -254,9 +288,9 @@ function paintRows(){
 // 档位是这个窗口自己的版面，和「开没开声音」一样不进守护进程的设置。
 // 高度写进 --dock-h，详情面板和地图控件据此让位。
 var VIEWS = ["bar", "half", "full"];
-var view = { air:"half", adsb:"bar" };
+var view = { air:"half", adsb:"bar", vdl2:"half" };
 try {
-  ["air", "adsb"].forEach(function(k){
+  ["air", "adsb", "vdl2"].forEach(function(k){
     var v = localStorage.getItem("ap.sdr.dock." + k);
     if (VIEWS.indexOf(v) >= 0) view[k] = v;
   });
@@ -268,6 +302,7 @@ var dkFreq, dkViews, dkCanvas, dkZoom, dkSig, dkSigNote, sigEls = {}, sigShown =
 var dkRec, dkRecBox, dkRecTxt, tbSig, tbRec, dkRecList, dkRecNote, dkRecSum, dkRecClr, recEls = {};
 var dkIq, dkIqVoice, tbIq, dkIqList, dkIqNote, dkIqSum, dkIqClr, iqEls = {}, iqClearArmed = 0;
 var sideTab = "sig", sideKey = "", playing = null, clearArmed = 0;
+var tbMsg, dkMsgList, dkMsgNote, dkMsgSum, dkMsgClr, msgEls = {}, msgOpen = {}, msgClearArmed = 0, patBox;
 
 function range(min, max, step){
   var r = document.createElement("input"); r.type = "range"; r.min = min; r.max = max; r.step = step; return r;
@@ -282,7 +317,7 @@ function buildDock(){
   dkTitle = el("b", "ttl"); dkNow = el("span", "now");
   dkSound = el("button", "sdr-btn go air", "开启声音"); dkSound.type = "button";
   dkPatrol = document.createElement("input"); dkPatrol.type = "checkbox";
-  var pat = el("label", "f tog air"); pat.append(dkPatrol, el("span", null, "轮巡"));
+  var pat = patBox = el("label", "f tog air"); pat.append(dkPatrol, el("span", null, "轮巡"));
   pat.title = "在各窗口间循环，有人说话时停下来听；连续播发的通播不会让它停下";
   dkVoice = document.createElement("input"); dkVoice.type = "checkbox";
   var vo = el("label", "f tog air"); vo.append(dkVoice, el("span", null, "无话音时静音"));
@@ -332,7 +367,13 @@ function buildDock(){
   tbRec.title = "话音触发录音存下的片段，点一下回放。文件在运行目录的 recordings/ 里（WAV 加一份同名 JSON）";
   tbIq = el("button", "tb", "I/Q"); tbIq.type = "button";
   tbIq.title = "存下的原始 I/Q，点一下回放：接收机换成这段录制，瀑布图、调谐、收听照常可用。文件在运行目录的 iq/ 里（.cu8 加一份同名 JSON）";
-  sh.append(tbSig, tbRec, tbIq);
+  // 「报文」页只在数据链模式下有：解出来的 VDL2 报文，新的在上
+  tbMsg = el("button", "tb", "报文"); tbMsg.type = "button";
+  tbMsg.title = "解出的 VDL2 数据链报文，点一行展开正文。同时按天写进运行目录的 vdl2/ 里（每行一条 JSON）";
+  sh.append(tbMsg, tbSig, tbRec, tbIq);
+  dkMsgList = el("div", "sl"); dkMsgNote = el("div", "sn rn");
+  dkMsgSum = el("span"); dkMsgClr = el("button", "lnk", "清空"); dkMsgClr.type = "button";
+  dkMsgNote.append(dkMsgSum, dkMsgClr);
   dkSig = el("div", "sl"); dkSigNote = el("div", "sn");
   dkRecList = el("div", "sl"); dkRecNote = el("div", "sn rn");
   dkRecSum = el("span"); dkRecClr = el("button", "lnk", "清空"); dkRecClr.type = "button";
@@ -340,7 +381,7 @@ function buildDock(){
   dkIqList = el("div", "sl"); dkIqNote = el("div", "sn rn");
   dkIqSum = el("span"); dkIqClr = el("button", "lnk", "清空"); dkIqClr.type = "button";
   dkIqNote.append(dkIqSum, dkIqClr);
-  sig.append(sh, dkSig, dkSigNote, dkRecList, dkRecNote, dkIqList, dkIqNote);
+  sig.append(sh, dkMsgList, dkMsgNote, dkSig, dkSigNote, dkRecList, dkRecNote, dkIqList, dkIqNote);
   spec.append(wrap, sig);
 
   dkWins = el("div", "wins air");
@@ -359,6 +400,13 @@ function buildDock(){
   tbSig.addEventListener("click", function(){ tbSig.blur(); sideTab = "sig"; renderSide(); });
   tbRec.addEventListener("click", function(){ tbRec.blur(); sideTab = "rec"; renderSide(); });
   tbIq.addEventListener("click", function(){ tbIq.blur(); sideTab = "iq"; renderSide(); });
+  tbMsg.addEventListener("click", function(){ tbMsg.blur(); sideTab = "msg"; renderSide(); });
+  dkMsgClr.addEventListener("click", function(){
+    dkMsgClr.blur();
+    if (Date.now() < msgClearArmed){ msgClearArmed = 0; send({ op:"vdl2", clear:true }); }
+    else { msgClearArmed = Date.now() + 3000; setTimeout(renderMsgs, 3100); }
+    renderMsgs();
+  });
   dkIq.addEventListener("click", function(){ dkIq.blur(); send({ op:"iq", on:!(st && st.iq && st.iq.active) }); });
   dkIqVoice.addEventListener("change", function(){ send({ op:"set", iq_with_voice:dkIqVoice.checked }); dkIqVoice.blur(); });
   dkIqClr.addEventListener("click", function(){
@@ -392,17 +440,20 @@ function dockHeight(){
   document.getElementById("wrap").style.setProperty("--dock-h", (on ? dock.offsetHeight : 0) + "px");
 }
 
-function dockMode(){               // 停靠栏此刻为谁而开："air"、"adsb"，不开则是 ""
+// 停靠栏此刻为谁而开："air"（话音，以及与它共用一套版面的数据链）、"adsb"，不开则是 ""
+function dockMode(){
   if (link !== "up" || !st) return "";
-  if (st.mode === "air" && st.air) return "air";
+  if (airLike() && st.air) return "air";
   if (st.mode === "adsb" && st.device.state === "ready" && view.adsb !== "bar") return "adsb";
   return "";
 }
-function curView(){ var m = dockMode(); return m ? view[m] : "bar"; }
+// 档位按模式各记各的，数据链也有自己的一份（版面与话音共用，档位不共用）
+function viewKey(){ return st && view[st.mode] ? st.mode : ""; }
+function curView(){ return dockMode() ? view[viewKey()] : "bar"; }
 
 function setView(v){               // 不给 v（或给了不认识的）就在三档间循环
-  if (link !== "up" || !st || (st.mode !== "air" && st.mode !== "adsb")) return false;
-  var k = st.mode;
+  var k = link === "up" ? viewKey() : "";
+  if (!k) return false;
   if (VIEWS.indexOf(v) < 0) v = VIEWS[(VIEWS.indexOf(view[k]) + 1) % VIEWS.length];
   view[k] = v;
   try { localStorage.setItem("ap.sdr.dock." + k, v); } catch (e) {}   // 记不住也无妨
@@ -444,7 +495,7 @@ document.addEventListener("visibilitychange", function(){ syncSpectrum(); });
 function reachOf(ch){ return ch.spacing === "8.33" ? 2500 : 9000; }   // 频率跟踪的范围，与守护进程一致
 
 function channelNear(hz, slack){   // 当前窗口里离 hz 最近、且 hz 落在它跟踪范围（或 slack）内的频道
-  var air = st && st.mode === "air" && st.air, best = null, bd = 1e12;
+  var air = airLike() && st.air, best = null, bd = 1e12;
   if (!air || !chan) return null;
   for (var k=0;k<air.channels.length;k++){
     var ch = air.channels[k], d = Math.abs(hz - ch.hz);
@@ -463,17 +514,17 @@ function candNear(hz, within){     // 此刻还在的候选里离 hz 最近的
 function pickSlack(){ return wf ? Math.max(1500, 3 * wf.hzPerPx()) : 1500; }   // 鼠标点不了那么准，给三个像素的余量
 
 function pickFreq(hz){             // 点了瀑布图上的一点
-  if (!st || st.mode !== "air" || !st.air) return;        // ADS-B 模式下只看不调
-  audioStart();
+  if (!airLike() || !st.air) return;                      // ADS-B 模式下只看不调
   var c = candNear(hz, pickSlack());                      // 点在一根载波上：以它实测的频率为准
-  if (c && c.ch != null){ send({ op:"listen", ch:c.ch }); return; }
-  var ch = c ? null : channelNear(hz, pickSlack());
+  var ch = c ? (c.ch != null ? chById(c.ch) : null) : channelNear(hz, pickSlack());
+  if (ch && ch.data){ sideTab = "msg"; renderSide(); return; }   // 数据链频道没有话音可听：带去看报文
+  audioStart();
   if (ch) send({ op:"listen", ch:ch.id });
   else send({ op:"tune", hz:Math.round(c ? sigName(c).hz : hz) });
 }
 
 function describeFreq(hz){         // 鼠标悬停处的说明
-  if (!st || st.mode !== "air") return "";
+  if (!airLike()) return "";
   var c = candNear(hz, pickSlack());
   if (c) return sigName(c).text;
   var ch = channelNear(hz, pickSlack());
@@ -483,7 +534,7 @@ function describeFreq(hz){         // 鼠标悬停处的说明
 function paintMarks(){
   if (!wf) return;
   var m = { channels:[], cands:[], listen:null };
-  if (st && st.mode === "air" && st.air && chan){
+  if (airLike() && st.air && chan){
     st.air.channels.forEach(function(ch){
       if (ch.win !== chan.win) return;
       var mine = chan.listen === ch.id;
@@ -550,6 +601,7 @@ function sigName(c){               // → { text, hz, ap }：这个信号可能�
   if (c.ch != null && air)
     for (var k=0;k<air.channels.length;k++) if (air.channels[k].id === c.ch){
       var ch = air.channels[k];
+      if (ch.data) return { text:"VDL2 数据链 " + ch.label, hz:ch.hz };
       // 手动调出来的频道不来自任何频率表，「手动」二字没说它是谁：接着往下猜
       if (ch.rows.length) return { text:(ch.type ? ch.type + " " : "") + ch.label, hz:ch.hz };
       manual = ch;
@@ -571,7 +623,10 @@ function makeSig(){
   e.go.append(e.dot, e.mhz, e.db, e.name, e.when);
   e.root.append(e.go, e.ap);
   e.go.addEventListener("click", function(){
-    e.go.blur(); audioStart();
+    e.go.blur();
+    var ch = e.c.ch != null ? chById(e.c.ch) : null;
+    if (ch && ch.data){ sideTab = "msg"; renderSide(); return; }
+    audioStart();
     if (e.c.ch != null) send({ op:"listen", ch:e.c.ch });
     else send({ op:"tune", hz:Math.round(e.who.hz) });
   });
@@ -579,8 +634,12 @@ function makeSig(){
   return e;
 }
 
-// 「信号」页只在话音模式下有。ADS-B 模式下停靠栏右侧只有录音和 I/Q 两页
-function curTab(){ return dockMode() !== "air" && sideTab === "sig" ? "rec" : sideTab; }
+// 「信号」页只在话音和数据链模式下有，「报文」页只在数据链模式下有。
+// ADS-B 模式下停靠栏右侧只有录音和 I/Q 两页
+function curTab(){
+  var t = sideTab === "msg" && !inVdl() ? "sig" : sideTab;
+  return dockMode() !== "air" && t === "sig" ? "rec" : t;
+}
 
 function renderSide(){             // 右侧栏此刻显示哪一页
   if (!dkSig) return;
@@ -588,6 +647,10 @@ function renderSide(){             // 右侧栏此刻显示哪一页
   tbSig.classList.toggle("cur", tab === "sig");
   tbRec.classList.toggle("cur", tab === "rec");
   tbIq.classList.toggle("cur", tab === "iq");
+  tbMsg.classList.toggle("cur", tab === "msg");
+  tbMsg.style.display = inVdl() ? "" : "none";
+  tbMsg.textContent = "报文" + (vd.seq ? " " + vd.seq : "");
+  dkMsgList.style.display = dkMsgNote.style.display = tab === "msg" ? "" : "none";
   tbRec.textContent = "录音" + (recs.count ? " " + recs.count : "");
   tbIq.textContent = "I/Q" + (iqs.count ? " " + iqs.count : "");
   dkSig.style.display = dkSigNote.style.display = tab === "sig" ? "" : "none";
@@ -596,6 +659,129 @@ function renderSide(){             // 右侧栏此刻显示哪一页
   renderSignals();
   renderRecs();
   renderIqs();
+  renderMsgs();
+}
+
+// ---------- VDL2 数据链 ----------
+// 守护进程把 dumpvdl2 解出的报文精简后整份推过来（最近 200 条，新的在前）。这里做三件事：
+// 列出来；把报文里的飞机地址对到地图上——状态表里有这架飞机，就给它套个圈、行上给一个
+// 「定位」；航班详情开着时，把这架飞机的报文列在里面。
+// 数据链模式下本地 ADS-B 是停的（一只接收机同一时刻只能看一段频率），所以地图上的飞机
+// 全靠联网数据；没开「实时航班」时如实说明，而不是让人以为对不上。
+var TAG_S = 600;                   // 最近这么久发过报文的飞机才带圈
+var tagKey = "", fdBox = null;
+
+function msgKey(m){ return (vd.replay ? "r" : "l") + m.n; }
+function msgWho(m){               // 这条报文关乎谁：航班号、注册号、地图上的呼号，都没有就写地址
+  if (!m.hex){
+    var g = m.src && m.src.k === "gs" ? m.src : null;
+    return g ? "地面站 " + g.a.toUpperCase() : "—";
+  }
+  var r = app.ac.get(m.hex);
+  return m.flight || (r && r.cs) || m.reg || (r && r.reg) || m.hex.toUpperCase();
+}
+function msgTip(m){
+  function end(a){ return a ? (a.k === "ac" ? "飞机 " : (a.k === "gs" ? "地面站 " : "全体 ")) + a.a.toUpperCase() +
+                              (a.st === "air" ? "（空中）" : (a.st === "gnd" && a.k === "ac" ? "（地面）" : "")) : "?"; }
+  return [end(m.src) + " → " + end(m.dst), mhz(m.hz) + " MHz",
+          m.lvl != null ? "信号 " + String(m.lvl).replace("-", "−") + " dBFS" : "",
+          m.reg ? "注册号 " + m.reg : "", m.flight ? "航班 " + m.flight : "",
+          m.replay ? "回放里解出的，时刻是回放的时刻" : ""].filter(Boolean).join(" · ");
+}
+
+function makeMsg(m){
+  var e = { root:el("div", "sg mg live"), go:el("button", "go"), dir:el("i", "pl"), time:el("b"),
+            who:el("span", "db"), sum:el("span", "nm"), fq:el("span", "du"), loc:el("button", "ap", "定位"),
+            text:el("pre", "tx"), m:m, key:msgKey(m) };
+  e.go.type = e.loc.type = "button";
+  e.go.append(e.dir, e.time, e.who, e.sum, e.fq);
+  e.root.append(e.go, e.loc, e.text);
+  e.time.textContent = clockOf(m.t);
+  e.dir.textContent = m.dir === "down" ? "↓" : (m.dir === "up" ? "↑" : "·");
+  e.dir.title = m.dir === "down" ? "飞机发的（下行）" : (m.dir === "up" ? "地面站发的（上行）" : "");
+  e.sum.textContent = m.sum || "—";
+  e.fq.textContent = mhz(m.hz);
+  e.text.textContent = m.text || "（这一帧没有正文）";
+  e.loc.title = "在地图上打开这架飞机";
+  e.go.addEventListener("click", function(){
+    e.go.blur();
+    if (msgOpen[e.key]) delete msgOpen[e.key]; else msgOpen[e.key] = 1;
+    renderMsgs();
+  });
+  e.loc.addEventListener("click", function(){ e.loc.blur(); if (e.m.hex) app.ac.open(e.m.hex); });
+  return e;
+}
+
+function renderMsgs(){
+  if (!dkMsgList || !dockMode() || curView() === "bar" || curTab() !== "msg") return;
+  var seen = {};
+  vd.list.slice(0, 80).forEach(function(m, i){
+    var k = msgKey(m), e = msgEls[k] || (msgEls[k] = makeMsg(m));
+    seen[k] = 1;
+    // 呼号要等飞机出现在地图上才知道，所以每次都重填；「定位」也是飞机在图上才有
+    e.who.textContent = msgWho(m);
+    e.go.title = msgTip(m);
+    e.loc.style.display = m.hex && app.ac.get(m.hex) ? "" : "none";
+    e.root.classList.toggle("open", !!msgOpen[k]);
+    e.root.classList.toggle("bare", m.kind === "avlc");
+    if (dkMsgList.children[i] !== e.root) dkMsgList.insertBefore(e.root, dkMsgList.children[i] || null);
+  });
+  for (var n in msgEls) if (!seen[n]){ msgEls[n].root.remove(); delete msgEls[n]; delete msgOpen[n]; }
+  var v = st && st.vdl2, log = v && v.log, bits = [];
+  if (vd.replay) bits.push("回放里解出的报文，不写日志");
+  else if (!vd.list.length) bits.push(v && v.state === "running" ? "解码器在跑，还没收到报文。136.975 MHz 上的突发是一阵一阵的"
+                                                                : "还没有报文");
+  else if (log && log.quota_bytes) bits.push("日志 " + megabytes(log.bytes) + " / " + megabytes(log.quota_bytes));
+  if (vd.list.length && !vd.replay && !app.ac.count("net"))
+    bits.push("打开侧栏的「实时航班」，报文才能对到地图上的飞机");
+  dkMsgSum.textContent = bits.join(" · ");
+  dkMsgSum.title = "报文同时按天写进运行目录的 vdl2/ 里，超过上限时从最旧的删起";
+  dkMsgClr.style.display = vd.list.length && !vd.replay ? "" : "none";
+  dkMsgClr.textContent = Date.now() < msgClearArmed ? "再点一次确认" : "清空";
+}
+
+function syncTags(){               // 哪些飞机该带圈：最近发过报文的。回放里的不算——那不是此刻的事
+  var now = Date.now() / 1000, set = {}, keys = [];
+  if (!vd.replay) vd.ac.forEach(function(a){ if (now - a.last <= TAG_S){ set[a.hex] = 1; keys.push(a.hex); } });
+  var key = keys.sort().join(",");
+  if (key === tagKey) return;
+  tagKey = key;
+  if (app.ac.tag) app.ac.tag("dl", set);
+}
+
+function onVdl2(){
+  syncTags();
+  if (dkMsgList){ renderSide(); paintChips(); }
+  fillFlightBox();
+  render();
+}
+
+// 航班详情里的「数据链报文」一组。详情开着时来了新报文，这一组跟着更新
+function flightExtra(body, hex){
+  var box = el("div", "cgrp sdr-fd"); box.style.display = "none";
+  body.append(box);
+  fdBox = { hex:hex, box:box, key:"" };
+  fillFlightBox();
+}
+function fillFlightBox(){
+  var f = fdBox; if (!f) return;
+  if (!f.box.isConnected){ fdBox = null; return; }
+  var mine = vd.list.filter(function(m){ return m.hex === f.hex; }).slice(0, 6);
+  var key = (vd.replay ? "r" : "l") + mine.map(function(m){ return m.n; }).join(",");
+  if (key === f.key) return;
+  f.key = key;
+  f.box.innerHTML = "";
+  f.box.style.display = mine.length ? "" : "none";
+  if (!mine.length) return;
+  f.box.append(el("b", null, "数据链报文" + (vd.replay ? "（回放）" : "")));
+  mine.forEach(function(m){
+    var row = el("div", "fm");
+    row.append(el("span", "t", clockOf(m.t) + (m.dir === "down" ? " ↓ " : (m.dir === "up" ? " ↑ " : " "))),
+               el("span", "s", m.sum || "—"));
+    row.title = msgTip(m);
+    f.box.append(row);
+    if (m.text) f.box.append(el("pre", "tx", m.text));
+  });
 }
 
 function renderSignals(){
@@ -680,7 +866,8 @@ function renderRecs(){
 // 把这件事明明白白写出来，并给一个回到实时的出口。
 function iqTitle(r){
   var code = (r.airport_label || "").split(" ")[0];
-  return (r.mode === "adsb" ? "ADS-B 1090 MHz" : "窗口 " + mhz(r.center_hz) + (code ? " · " + code : "")) +
+  return (r.mode === "adsb" ? "ADS-B 1090 MHz" : (r.mode === "vdl2" ? "VDL2 · " : "") + "窗口 " + mhz(r.center_hz) +
+                                                 (code ? " · " + code : "")) +
          (r.kind === "voice" ? " · 话音触发" : "");
 }
 function makeIq(r){
@@ -761,9 +948,11 @@ function fillWindows(air){               // 频道表或窗口划分变了才重
   dkWins.innerHTML = "";
   air.windows.forEach(function(w, wi){
     var box = el("div", "win"), head = el("button", "wl"); head.type = "button";
-    head.textContent = (air.windows.length > 1 ? "窗口 " + (wi + 1) + " · " : "") +
+    head.textContent = (w.data ? "数据链窗口 · " : (air.windows.length > 1 ? "窗口 " + (wi + 1) + " · " : "")) +
                        (w.lo_hz === w.hi_hz ? mhz(w.lo_hz) : mhz(w.lo_hz) + "–" + mhz(w.hi_hz));
-    head.title = "接收机一次只能看 1.92 MHz。点这里切到这个窗口";
+    head.title = w.data ? "数据链频道和落在同一个窗口里的话音频道。话音可以边收报文边听"
+                        : "接收机一次只能看 1.92 MHz。点这里切到这个窗口" +
+                          (inVdl() ? "（会离开数据链，没人听了自动回来）" : "");
     head.addEventListener("click", function(){ head.blur(); audioStart(); send({ op:"window", i:wi }); });
     var chips = el("div", "chips");
     w.ch.forEach(function(id){
@@ -773,7 +962,18 @@ function fillWindows(air){               // 频道表或窗口划分变了才重
       var c = el("button", "chip"); c.type = "button"; c.dataset.ch = id;
       c.append(el("i", "sdr-dot"), el("b", null, ch.type || "—"), el("span", null, ch.label));
       c.title = [ch.desc, mhz(ch.hz) + " MHz", ch.spacing === "8.33" ? "8.33 kHz 频道" : ""].filter(Boolean).join(" · ");
-      c.addEventListener("click", function(){ c.blur(); audioStart(); send({ op:"listen", ch:id }); });
+      if (ch.data){                      // 数据链频道：不能收听，点它是去看报文。灯亮 = 看到了突发，数字 = 解出的条数
+        c.classList.add("data"); c.dataset.hz = ch.hz;
+        c.append(el("em", "ct", "0"));
+        c.addEventListener("click", function(){ c.blur(); sideTab = "msg"; if (curView() === "bar") setView("half"); renderSide(); });
+        chips.append(c);
+        return;
+      }
+      c.addEventListener("click", function(){
+        c.blur(); audioStart();
+        // 数据链模式下再点一下正在听的话音频道 = 不听了（报文照收），不是离开这个模式
+        send({ op:"listen", ch:inVdl() && chan && chan.listen === id ? null : id });
+      });
       if (!ch.rows.length){              // 手动调出来的频道不属于任何频率表：给一个删除的叉
         var x = el("span", "x", "×"); x.title = "删除这个手动频道"; x.setAttribute("role", "button");
         x.setAttribute("aria-label", "删除手动频道 " + ch.label);
@@ -787,9 +987,22 @@ function fillWindows(air){               // 频道表或窗口划分变了才重
   });
 }
 
+function paintChips(){             // 数据链频道标签上的条数。条数变了频道表并没变，所以单独刷
+  if (!dkWins || !st || !st.vdl2) return;
+  var chips = dkWins.querySelectorAll(".chip.data"), now = Date.now() / 1000;
+  for (var i=0;i<chips.length;i++){
+    var f = null;
+    for (var k=0;k<st.vdl2.freqs.length;k++) if (st.vdl2.freqs[k].hz === +chips[i].dataset.hz) f = st.vdl2.freqs[k];
+    chips[i].lastChild.textContent = f ? fmt(f.n) : "0";
+    chips[i].classList.toggle("rx", !!(f && f.last && now - f.last < 3));
+  }
+}
+
 function nowLine(air){
   var ch = null;
   if (chan) for (var k=0;k<air.channels.length;k++) if (air.channels[k].id === chan.listen) ch = air.channels[k];
+  if (!ch && inVdl() && chan) return ["", "未收听话音" + (air.windows[0].ch.length > st.vdl2.freqs.length
+                                                        ? " · 点同窗的话音频道，可以边收报文边听" : "")];
   if (!ch) return ["", "正在调谐…"];
   var name = (ch.type ? ch.type + " " : "") + ch.label, lv = chan.level[ch.id];
   if (chan.open && st.voice_only && !chan.voice)   // 有载波但没人说话：不出声，并说清楚为什么
@@ -811,6 +1024,7 @@ function renderDock(){
   var mode = dockMode(), air = mode === "air" ? st.air : null, v = curView();
   dock.classList.toggle("on", !!mode);
   dock.classList.toggle("adsb", mode === "adsb");
+  dock.classList.toggle("vdl2", mode === "air" && inVdl());
   dock.dataset.view = v;
   if (mode && v !== "bar") loadWaterfall();
   for (var b=0;b<dkViews.children.length;b++)
@@ -818,12 +1032,14 @@ function renderDock(){
   dkCanvas.style.cursor = air ? "crosshair" : "default";
   dkCanvas.title = "";
   if (air){
-    var key = JSON.stringify([air.windows, air.channels.map(function(c){ return [c.id, c.type, c.label]; })]);
+    var key = JSON.stringify([st.mode, air.windows, air.channels.map(function(c){ return [c.id, c.type, c.label]; })]);
     if (key !== dockKey){ dockKey = key; fillWindows(air); }
-    dkTitle.textContent = (st.replay ? "回放 · " : "") + "话音监听" + (air.label ? " · " + air.label : "");
+    dkTitle.textContent = (st.replay ? "回放 · " : "") + (inVdl() ? "数据链 · VDL2" : "话音监听") +
+                          (air.label ? " · " + air.label : "");
     var now = st.device.state !== "ready" ? ["", "等待接收机…"] : nowLine(air);
     if (st.auto_return_s != null && !soundReady())
-      now = ["warn", "声音未开启 · " + st.auto_return_s + " 秒后" + (st.return_to === "off" ? "关闭接收机" : "回到 ADS-B")];
+      now = ["warn", "声音未开启 · " + st.auto_return_s + " 秒后" + backWhere()];
+    patBox.style.display = inVdl() ? "none" : "";          // 数据链模式下不轮巡：窗口一挪走报文就断了
     dkNow.className = "now " + now[0]; dkNow.textContent = now[1];
     dkSound.style.display = soundReady() ? "none" : "";
     dkSound.textContent = audioErr || "开启声音";
@@ -839,7 +1055,8 @@ function renderDock(){
     dkRec.checked = !!(st.rec && st.rec.on);
     dkRecBox.classList.toggle("live", recS != null);
     dkRecTxt.textContent = recS != null ? "录音 " + minSec(recS) : "录音";
-    dkBack.textContent = st.replay ? "返回实时" : (st.return_to === "off" ? "停止并释放设备" : "返回 ADS-B");
+    dkBack.textContent = st.replay ? "返回实时" : backLabel();
+    dkBack.style.display = inVdl() && !st.replay ? "none" : "";    // 数据链是常驻模式，没有「返回」；回放时有
     dkIqVoice.checked = !!(st.iq && st.iq.with_voice);
     var wins = dkWins.children;
     for (var w=0;w<wins.length;w++) wins[w].classList.toggle("cur", !!chan && chan.win === w);
@@ -850,6 +1067,7 @@ function renderDock(){
       chips[i].classList.toggle("cur", !!chan && chan.listen === id);
       lamp(chips[i].firstChild, ch);
     }
+    paintChips();
   } else if (mode === "adsb"){
     // ADS-B 模式下只看不调。1090 MHz 上是一个个 120 微秒的脉冲，平均下来是中心附近的一片隆起
     var s = wf && specOn ? wf.stats() : null;
@@ -868,7 +1086,8 @@ function renderDock(){
                      "并带上按下之前的 1.5 秒。再点停止，最长 " + (st && st.iq ? st.iq.max_s : 60) + " 秒";
   syncSpectrum();
   paintMarks();
-  var sk = mode + v + (st && st.rec ? st.rec.on : "") + (st && st.replay ? st.replay.name : "");
+  var sk = mode + v + (st ? st.mode : "") + (st && st.rec ? st.rec.on : "") + (st && st.replay ? st.replay.name : "") +
+           (st && st.vdl2 ? st.vdl2.state + (st.vdl2.log ? st.vdl2.log.bytes : "") : "") + app.ac.count("net");
   if (sideKey !== sk){ sideKey = sk; renderSide(); }
   dockHeight();
   paintRows();
@@ -889,6 +1108,7 @@ function describe(){
   if (d === "error")     return ["err", "接收机出错 · " + (st.error || "")];
   if (d !== "ready")     return ["busy", "接收机 · 正在打开设备…"];
   if (st.mode === "air") return describeAir();
+  if (st.mode === "vdl2") return describeVdl();
   var a = st.adsb;
   if (a.state === "no_readsb") return ["err", "缺少解码器 · 终端执行 brew install readsb"];
   if (a.state === "failed")    return ["warn", "解码器异常退出，正在重启"];
@@ -908,6 +1128,24 @@ function autoRec(){               // 开着哪种自动录制：写进提示里�
   return a && b ? "录音和录 I/Q" : (a ? "录音" : (b ? "录 I/Q" : ""));
 }
 
+// 数据链模式下的状态条。同窗有话音在听的话，也写上
+function describeVdl(){
+  var v = st.vdl2 || {}, who = st.replay ? "回放 · " : "本地接收 · ";
+  var tail = st.replay ? " · 真接收机已释放" : " · 本地 ADS-B 已暂停";
+  for (var i=0;i<st.warnings.length;i++){
+    if (st.warnings[i].code === "stalled") return ["warn", "接收机已打开但没有数据 · 试试重新插拔"];
+    if (st.warnings[i].code === "dsp") return ["err", "解调出错 · " + st.warnings[i].msg];
+  }
+  if (v.state === "no_dumpvdl2") return ["err", "缺少解码器 · 终端执行 sdr/tools/build-dumpvdl2.sh"];
+  if (v.state === "failed") return ["warn", "VDL2 解码器异常退出，正在重启" + (v.error ? " · " + v.error : "")];
+  if (v.state !== "running") return ["busy", who + "VDL2 136.975 · 启动中…"];
+  var ch = chan && chan.listen != null ? chById(chan.listen) : null;
+  var text = who + "VDL2 136.975 · " + v.per_min + " 条/分 · " + v.ac + " 架";
+  if (ch) text += " · 同时听 " + (ch.type ? ch.type + " " : "") + ch.label + (muted ? "（已静音）" : "");
+  if (v.lagging) tail += " · ⚠ 解码跟不上，正在丢采样";
+  return [v.per_min ? "ok" : "idle", text + tail];
+}
+
 // 话音模式下的状态条。本地 ADS-B 此时是停的，这件事每一种说法里都带着。
 function describeAir(){
   var air = st.air, tail = st.replay ? " · 真接收机已释放" : " · 本地 ADS-B 已暂停";
@@ -918,7 +1156,7 @@ function describeAir(){
   if (!air || !chan) return ["busy", (st.replay ? "回放 · " : "本地接收 · ") + "话音 · 正在调谐…"];
   if (!soundReady())
     return [autoRec() ? "idle" : "warn", "话音 · " + (audioErr || "声音未开启，点下方「开启声音」") +
-            (st.auto_return_s != null ? " · " + st.auto_return_s + " 秒后" + (st.return_to === "off" ? "关闭" : "回到 ADS-B")
+            (st.auto_return_s != null ? " · " + st.auto_return_s + " 秒后" + backWhere(true)
                                       : (autoRec() ? " · " + autoRec() + "开着，不会自动返回" : ""))];
   var now = nowLine(air), head = (st.replay ? "回放 · " : "本地接收 · ") + "话音 · ";
   if (air.patrol) head += "轮巡" + (air.windows.length > 1 ? " " + (chan.win + 1) + "/" + air.windows.length : "") + " · ";
@@ -935,7 +1173,7 @@ function flash(msg){
   flashTimer = setTimeout(function(){ flashMsg = ""; render(); }, 4000);
 }
 
-var pill, pillBack, grp, cb, cnt, hint, homeBtn, homeClr, specBtn, gainSel, dev;
+var pill, pillBack, grp, cb, cnt, cbV, cntV, hint, homeBtn, homeClr, specBtn, gainSel, dev;
 function build(){
   pill = el("div"); pill.id = "sdrPill";
   pillBack = el("button", "back"); pillBack.type = "button";
@@ -950,6 +1188,12 @@ function build(){
   cb = document.createElement("input"); cb.type = "checkbox";
   cnt = el("span", "c");
   row.append(cb, el("span", "n", "接收 ADS-B（1090 MHz）"), cnt);
+  // 一只接收机同一时刻只能看一段频率：这两项是二选一，勾一个另一个自己取消
+  var rowV = el("label", "row"); rowV.style.marginTop = "5px";
+  cbV = document.createElement("input"); cbV.type = "checkbox";
+  cntV = el("span", "c");
+  rowV.append(cbV, el("span", "n", "接收 VDL2 数据链（136.975 MHz）"), cntV);
+  rowV.title = "飞机与地面站之间的数字报文。和 ADS-B 不能同时收；同一个窗口里的话音频道可以照常听（数字键 3）";
   hint = el("div", "hint");
   var btns = el("div", "sdr-btns");
   homeBtn = el("button", "sdr-btn"); homeBtn.type = "button";
@@ -967,11 +1211,14 @@ function build(){
   dev = el("div"); dev.id = "sdrDev";
   adv.append(f, dev);
 
-  grp.append(row, hint, btns, adv);
+  grp.append(row, rowV, hint, btns, adv);
   document.getElementById("scroll").appendChild(grp);
 
   cb.addEventListener("change", function(){
     if (!send({ op:"mode", mode: cb.checked ? "adsb" : "off" })) cb.checked = !cb.checked;
+  });
+  cbV.addEventListener("change", function(){
+    if (!send({ op:"mode", mode: cbV.checked ? "vdl2" : "off" })) cbV.checked = !cbV.checked;
   });
   homeBtn.addEventListener("click", function(){ setPicking(!picking); });
   homeClr.addEventListener("click", function(){ send({ op:"home", lat:null, lon:null }); });
@@ -982,7 +1229,8 @@ function build(){
 }
 
 function specShown(){             // 当前模式下瀑布图开着没有（不管停靠栏此刻是否可见）
-  return !!st && (st.mode === "air" || st.mode === "adsb") && view[st.mode] !== "bar";
+  var k = viewKey();
+  return !!k && view[k] !== "bar";
 }
 
 var gainKey = "";
@@ -999,12 +1247,16 @@ function render(){
   // 回放时这个按钮是「返回实时」，在哪个模式下都有
   var replaying = up && !!st.replay;
   pillBack.style.display = (inAir || replaying) && !picking ? "" : "none";
-  pillBack.textContent = replaying ? "返回实时" : (inAir && st.return_to === "off" ? "停止" : "返回 ADS-B");
+  pillBack.textContent = replaying ? "返回实时" : backLabel(true);
   renderDock();
-  specBtn.disabled = !up || (st.mode !== "air" && st.mode !== "adsb");
+  specBtn.disabled = !up || !viewKey();
   specBtn.textContent = specShown() ? "隐藏瀑布图" : "显示瀑布图";
   cb.disabled = !up;
   cb.checked = up && st.mode === "adsb";
+  cbV.disabled = !up || !vdlAvail();
+  cbV.checked = up && st.mode === "vdl2";
+  var vOn = up && st.mode === "vdl2" && st.vdl2 && st.vdl2.state === "running";
+  cntV.textContent = vOn ? fmt(st.vdl2.total) + " 条" : "";
   homeBtn.disabled = homeClr.disabled = gainSel.disabled = !up;
   homeBtn.textContent = picking ? "取消点选" : (up && st.home ? "重设接收机位置" : "设定接收机位置");
   homeClr.style.display = up && st.home ? "" : "none";
@@ -1017,7 +1269,10 @@ function render(){
     if (st.home && st.adsb.max_nm) bits.push("最远收到 " + app.units.dist(st.adsb.max_nm));
     if (!st.home) bits.push("设定接收机位置后可显示距离圈和接收范围");
   }
-  if (inAir) bits.push("正在监听话音，本地 ADS-B 已暂停。勾选上面这项即返回");
+  if (inAir) bits.push("正在监听话音，本地 ADS-B 已暂停。勾选上面" + (vdlAvail() ? "任一项" : "这项") + "即返回");
+  if (vOn) bits.push("正在收数据链，本地 ADS-B 已暂停。" + st.vdl2.ac + " 架飞机发过报文");
+  // 页面文件一刷新就是新的，守护进程要重启才换新：对着旧进程时把这一项置灰并说明
+  if (up && !vdlAvail()) bits.push("接收机服务是旧版本，重启 serve.py 后才能收 VDL2");
   hint.textContent = bits.join(" · ");
 
   // 设备信息如实写：是什么型号由驱动认定，外壳上印的不算
@@ -1028,6 +1283,7 @@ function render(){
     if (st.device.range_hz && st.device.range_hz[1])
       info.push("可调谐 " + (st.device.range_hz[0] / 1e6) + "–" + (st.device.range_hz[1] / 1e6) + " MHz");
     if (st.adsb.pipe_drops) info.push("解码管道丢弃 " + fmt(st.adsb.pipe_drops) + " 字节");
+    if (st.vdl2 && st.vdl2.pipe_drops) info.push("VDL2 解码管道丢弃 " + fmt(st.vdl2.pipe_drops) + " 字节");
   }
   dev.textContent = info.join("\n");
   dev.style.whiteSpace = "pre-line";
@@ -1116,9 +1372,11 @@ build();
 addHomeLayers();
 app.hooks.styleReady.push(addHomeLayers);          // 切换底图会销毁图层，要跟着重挂
 app.hooks.flightDetail = flightDetail;
+app.hooks.flightExtra = flightExtra;
 app.hooks.freqRow = freqRow;
 app.hooks.units = function(){ drawHome(); render(); };      // 距离圈的标注和「最远收到」跟着换
-app.hooks.detail = function(id){ if (id == null) rowsUI = { ap:null, items:[] }; paintRows(); };
+// 详情面板换了内容：先当它不再是航班（是的话 flightExtra 随后会来）
+app.hooks.detail = function(id){ fdBox = null; if (id == null) rowsUI = { ap:null, items:[] }; paintRows(); };
 // 这个脚本是异步到的。它来之前机场详情可能已经开着，那张频率表上还没有按钮：重画一遍
 if (app.airport.shown() != null) app.airport.show(app.airport.shown());
 // Esc 逐层收：先取消点选；瀑布图展开着就先收到半高；都不是才轮到主页面关详情面板
@@ -1160,7 +1418,25 @@ function act(name, arg){
   if (name === "view") return setView(arg);                // 不带参数即在三档间循环
   // 录音：都走真实的点击路径
   if (name === "record"){ if (dkRec.checked !== !!arg) dkRec.click(); return true; }
-  if (name === "sideTab"){ (arg === "rec" ? tbRec : (arg === "iq" ? tbIq : tbSig)).click(); return true; }
+  if (name === "sideTab"){ (arg === "rec" ? tbRec : (arg === "iq" ? tbIq : (arg === "msg" ? tbMsg : tbSig))).click(); return true; }
+  // 数据链：同样走真实的点击路径
+  if (name === "clickMsg" || name === "locateMsg"){
+    // arg 是第几行，或者一段文字：「谁」那一栏等于它、或摘要以它开头的第一行。
+    // 报文每秒都在往顶上加，按行号点会点到别的行上去
+    var all = dkMsgList.querySelectorAll(".mg"), mg = all[arg];
+    if (typeof arg === "string")
+      mg = [].filter.call(all, function(e){
+        return e.querySelector(".db").textContent === arg || e.querySelector(".nm").textContent.indexOf(arg) === 0; })[0];
+    if (!mg) return false;
+    mg.querySelector(name === "clickMsg" ? ".go" : ".ap").click(); return true;
+  }
+  if (name === "clearMsg"){ dkMsgClr.click(); return true; }
+  if (name === "vdl2"){ if (cbV.checked !== !!arg) cbV.click(); return true; }
+  if (name === "clickChip"){                               // 按标签上的频率点一个频道
+    var hit = [].filter.call(dkWins.querySelectorAll(".chip"), function(c){ return c.children[2].textContent === arg; })[0];
+    if (!hit) return false;
+    hit.click(); return true;
+  }
   if (name === "playRec" || name === "deleteRec"){
     var rc = dkRecList.querySelectorAll(".rc")[arg];
     if (!rc) return false;
@@ -1210,7 +1486,7 @@ window.addEventListener("sdr-command", function(e){
   act(d.name, d.arg);
 });
 
-// 键盘：1 接收 ADS-B，2 回到话音，0 关闭并释放设备，W 切换瀑布图的三档；
+// 键盘：1 接收 ADS-B，2 回到话音，3 接收 VDL2 数据链，0 关闭并释放设备，W 切换瀑布图的三档；
 // 话音模式下空格静音，左右方向键按 25 kHz 步进（按住 Shift 为 8.33 kHz）。
 // 正在输入框里打字时不抢键，带修饰键的组合留给浏览器和外壳的菜单。
 // 焦点在地图上时方向键归地图（平移），所以点一下地图之外的地方再用方向键调谐。
@@ -1220,12 +1496,14 @@ document.addEventListener("keydown", function(e){
   if (t && (/^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName) || t.isContentEditable)) return;
   if (e.key === "1") act("mode", "adsb");
   else if (e.key === "2"){ audioStart(); act("mode", "air"); }
+  else if (e.key === "3"){ if (vdlAvail()) act("mode", "vdl2"); else flash("接收机服务是旧版本，重启 serve.py 后才能收 VDL2"); }
   else if (e.key === "0") act("mode", "off");
   else if (e.key === "w" || e.key === "W") act("view");
-  if (!st || st.mode !== "air") return;
+  if (!airLike()) return;
+  var tuned = !!chan && chan.listen != null;               // 数据链模式下可能没在听任何话音：没有可静音、可步进的
   var onMap = t && t.closest && t.closest(".maplibregl-canvas-container");
   if (e.key === " " && !(t && /^(BUTTON|A|SUMMARY)$/.test(t.tagName))){ e.preventDefault(); act("mute"); }
-  else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !onMap){
+  else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !onMap && tuned){
     e.preventDefault();
     act("step", (e.key === "ArrowRight" ? 1 : -1) * (e.shiftKey ? 0.5 : 1));
   }
@@ -1260,7 +1538,7 @@ window.__sdr = {
                     cur:(function(){ var c = dkWins.querySelector(".chip.cur"); return c ? c.textContent : ""; })(),
                     back:dkBack.textContent, soundBtn:dkSound.style.display !== "none" },
              rf:st ? st.rf : null,
-             spectrum:{ view:curView(), views:{ air:view.air, adsb:view.adsb }, mode:dockMode(), on:specOn,
+             spectrum:{ view:curView(), views:{ air:view.air, adsb:view.adsb, vdl2:view.vdl2 }, mode:dockMode(), on:specOn,
                         loaded:!!wf, stats:wf ? wf.stats() : null, title:dkTitle.textContent,
                         watchers:st && st.spectrum ? st.spectrum.watchers : null,
                         daemonRows:st && st.spectrum ? st.spectrum.rows : null,
@@ -1268,6 +1546,27 @@ window.__sdr = {
                         canvas:{ w:dkCanvas.clientWidth, h:dkCanvas.clientHeight } },
              cands:cands,
              replay:st ? st.replay : null,
+             vdl2:{ avail:vdlAvail(), status:st ? st.vdl2 : null, seq:vd.seq, count:vd.list.length, replay:vd.replay,
+                    checkbox:{ checked:cbV.checked, disabled:cbV.disabled, count:cntV.textContent },
+                    tab:{ shown:tbMsg.offsetParent !== null, text:tbMsg.textContent, cur:tbMsg.classList.contains("cur") },
+                    sum:dkMsgSum.textContent, clear:dkMsgClr.style.display === "none" ? null : dkMsgClr.textContent,
+                    patrolShown:patBox.offsetParent !== null,
+                    rows:[].map.call(dkMsgList.querySelectorAll(".mg"), function(e){
+                      var t = e.querySelectorAll(".go > *");
+                      return { dir:t[0].textContent, time:t[1].textContent, who:t[2].textContent, sum:t[3].textContent,
+                               mhz:t[4].textContent, open:e.classList.contains("open"),
+                               locate:e.querySelector(".ap").style.display !== "none",
+                               text:e.querySelector(".tx").textContent,
+                               textShown:e.querySelector(".tx").offsetParent !== null }; }),
+                    chips:[].map.call(dkWins.querySelectorAll(".chip"), function(c){
+                      return { label:c.children[2].textContent, type:c.children[1].textContent,
+                               data:c.classList.contains("data"), count:c.classList.contains("data") ? c.lastChild.textContent : null,
+                               cross:!!c.querySelector(".x"), cur:c.classList.contains("cur") }; }),
+                    tags:tagKey ? tagKey.split(",") : [],
+                    flightBox:fdBox && fdBox.box.isConnected && fdBox.box.style.display !== "none"
+                      ? { title:fdBox.box.firstChild.textContent, rows:fdBox.box.querySelectorAll(".fm").length,
+                          after:(function(){ var p = fdBox.box.previousElementSibling; return p ? p.className : ""; })(),
+                          text:fdBox.box.textContent } : null },
              iq:{ active:st && st.iq ? st.iq.active : null, withVoice:st && st.iq ? st.iq.with_voice : null,
                   button:dkIq.textContent, buttonShown:dkIq.offsetParent !== null, live:dkIq.classList.contains("rec-on"),
                   count:iqs.count, bytes:iqs.bytes, tabText:tbIq.textContent, sum:dkIqSum.textContent,

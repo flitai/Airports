@@ -169,5 +169,33 @@ tr.sdr-cur td{background:rgba(37,99,235,.06)}
               cursor:pointer;text-decoration:underline}
 #sdrDock .lnk:hover{color:#dc2626}
 
+/* ---------- VDL2 数据链 ----------
+   版面与话音共用。右侧栏在这个模式下放宽：报文的正文是一行行定宽的字，250 像素装不下 */
+#sdrDock.vdl2 .sig{width:clamp(300px,34vw,460px)}
+#sdrDock.vdl2[data-view=half] .spec{--spec-h:200px}     /* 半高时多给一点：150 像素只放得下两条报文 */
+#sdrDock .chip.data{cursor:pointer;border-style:dashed}
+#sdrDock .chip.data b{color:#0e7490}
+#sdrDock .chip .ct{font-style:normal;font-size:10.5px;min-width:14px;padding:0 5px;border-radius:8px;
+                   background:#ecfeff;color:#0e7490;text-align:center}
+#sdrDock .chip.data.rx{border-color:#0891b2;border-style:solid}
+#sdrDock .chip.data.rx .ct{background:#0891b2;color:#fff}
+/* 报文列表：沿用信号列表的一行，点开后正文另起一行 */
+#sdrDock .mg{flex-wrap:wrap}
+#sdrDock .mg .go .pl{color:#0e7490;font-size:11px}
+#sdrDock .mg .go .db{color:inherit;font-weight:600}
+#sdrDock .mg.bare .go{opacity:.6}
+#sdrDock .mg .ap{color:var(--accent)}
+#sdrDock .mg .ap:hover{color:var(--accent);background:rgba(37,99,235,.07)}
+#sdrDock .mg .tx{display:none;flex:0 0 100%;box-sizing:border-box}
+#sdrDock .mg.open .tx{display:block}
+#sdrDock .mg.open{background:#f8fafc}
+.tx{margin:0;padding:6px 8px 7px;border-top:1px dashed var(--line);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    white-space:pre-wrap;word-break:break-word;color:#334155;max-height:220px;overflow:auto}
+/* 航班详情里的「数据链报文」 */
+.sdr-fd .fm{display:flex;gap:6px;margin-top:6px;font-size:12px;font-variant-numeric:tabular-nums}
+.sdr-fd .fm .t{flex:none;color:var(--dim)}
+.sdr-fd .fm .s{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sdr-fd .tx{border:0;margin-top:3px;background:#f8fafc;border-radius:5px;max-height:140px}
+
 /* 地图自带的比例尺和缩放按钮在底边，频道条出来时跟着上移 */
 #wrap .maplibregl-ctrl-bottom-left,#wrap .maplibregl-ctrl-bottom-right{bottom:var(--dock-h,0px)}

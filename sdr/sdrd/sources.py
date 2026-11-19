@@ -109,11 +109,11 @@ class SynthSource(_Paced):
     """
     kind = "synth"
 
-    def __init__(self, center=(0.0, 0.0), count=3, stations=()):
+    def __init__(self, center=(0.0, 0.0), count=3, stations=(), bursts=()):
         super().__init__()
         self.traffic = synth.Traffic(center, count)
         self.mod = synth.Modulator(self.traffic)
-        self.air = synth.AirBand(stations)
+        self.air = synth.AirBand(stations, bursts=bursts)
 
     def info(self):
         return {"model": "合成信号", "tuner": "—", "v4": False, "serial": "",
@@ -203,8 +203,10 @@ def make_source(spec, ppm=0):
 
     rtl                真实接收机（默认）
     file:<路径>         回放 cu8 录音
-    synth:adsb[:纬,经][;air:<台>,<台>…]
-                       合成 ADS-B 流量；可再加几个合成话音台，写法见 synth.Station.parse
+    synth:adsb[:纬,经][;air:<台>,<台>…][;vdl2:<wav>[@周期秒]]
+                       合成 ADS-B 流量；可再加几个合成话音台，写法见 synth.Station.parse；
+                       再加 vdl2 就在 136.975 MHz 上周期地发一段真的 VDL2 波形
+                       （synth.Vdl2Model；wav 写 model 表示编译脚本留下的那段模型信号）
     """
     if spec == "rtl":
         from .device import RtlSource
@@ -212,9 +214,15 @@ def make_source(spec, ppm=0):
     if spec.startswith("file:"):
         return FileReplaySource(spec[5:])
     if spec.startswith("synth:adsb"):
+        spec, _, link = spec.partition(";vdl2:")
         rest, _, air = spec[len("synth:adsb"):].partition(";air:")
         rest = rest.lstrip(":")
         center = tuple(float(x) for x in rest.split(",")) if rest else (0.0, 0.0)
         stations = [synth.Station.parse(x) for x in air.split(",") if x.strip()]
-        return SynthSource(center, stations=stations)
+        bursts = []
+        if link:
+            from . import vdl2
+            wav, _, period = link.partition("@")
+            bursts = [synth.Vdl2Model(vdl2.MODEL_WAV if wav == "model" else wav, period_s=float(period or 2))]
+        return SynthSource(center, stations=stations, bursts=bursts)
     raise ValueError(f"不认识的采样源：{spec}")

@@ -120,6 +120,44 @@ def manual(hz, ident):
             "label": "%.3f" % (hz / 1e6), "rows": [], "weight": 1, "cont": False, "win": 0, "manual": True}
 
 
+# ---- VDL2 数据链 ----
+# 窗口中心是固定的，不跟着话音频道表走：五个数据链频率离中心 +312.5 到 +562.5 kHz，
+# 远离中心的直流毛刺，也都在通带平坦处。让中心浮动的话，改一个话音频道解码器就得
+# 重启一次，最坏会把数据链频道摆到离直流 37.5 kHz 的地方。
+# 「同窗口」因此是一条算术判断：离中心不超过 VDL2_REACH 的话音频道，135.4675–137.0 MHz。
+VDL2_CENTER = 136_412_500
+VDL2_FREQS = (136_975_000, 136_725_000, 136_775_000, 136_825_000, 136_875_000)   # 第一个是公共信令频道
+VDL2_REACH = USABLE // 2 - 15_000
+DATA_ID = 1_000_000                          # 数据链频道的 id 从这儿起：频率表的从 0 起，手动的从 10001 起
+
+
+def data(hz, ident):
+    """数据链频道。进频道表是为了在频道条上占个位置、带上指示灯；它不能收听。"""
+    return {"id": ident, "type": "VDL2", "desc": "数据链", "hz": hz, "spacing": "25",
+            "label": "%.3f" % (hz / 1e6), "rows": [], "weight": 1, "cont": True, "win": 0, "data": "vdl2"}
+
+
+def plan_vdl2(voice):
+    """数据链模式的窗口划分 → (频道表, 窗口列表)。
+
+    第 0 个窗口固定是数据链窗口：数据链频道，加上落在它里面的话音频道。其余话音频道
+    照常分，窗口号顺延。正好压在数据链频率上的话音频道去掉——那儿没有话音可听。
+    """
+    voice = [c for c in voice if not c.get("data") and c["hz"] not in VDL2_FREQS]
+    inside = [c for c in voice if abs(c["hz"] - VDL2_CENTER) <= VDL2_REACH]
+    outside = [c for c in voice if abs(c["hz"] - VDL2_CENTER) > VDL2_REACH]
+    rest = plan(outside)
+    for c in outside:
+        c["win"] += 1
+    links = [data(hz, DATA_ID + i) for i, hz in enumerate(VDL2_FREQS)]
+    members = sorted(inside + links, key=lambda c: c["hz"])
+    for c in members:
+        c["win"] = 0
+    first = {"center_hz": VDL2_CENTER, "lo_hz": members[0]["hz"], "hi_hz": members[-1]["hz"],
+             "ch": [c["id"] for c in members], "data": True}
+    return voice + links, [first] + rest
+
+
 def _center(freqs):
     """窗口中心：落在 25 kHz 网格的半格上，并尽量让所有载波都离它远一点。
 

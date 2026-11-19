@@ -19,7 +19,8 @@ from .dsp.spectrum import DB_MIN, DB_STEP
 
 # 发送优先级：音频永远最先（单独一条队列，见 Client），其余按这张表，数值小的先发。
 # 频谱排在最后，而且只留最新一行。
-PRIORITY = {"status": 1, "channels": 2, "aircraft": 3, "outline": 4, "candidates": 5, "recordings": 6, "iqs": 7}
+PRIORITY = {"status": 1, "channels": 2, "aircraft": 3, "outline": 4, "candidates": 5, "recordings": 6, "iqs": 7,
+            "vdl2": 8}
 AUDIO_BACKLOG = 25                       # 每个页面最多积压 25 帧 = 500 毫秒，再多就丢最旧的
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "[::1]")
 
@@ -184,10 +185,11 @@ class Server:
         await ws.prepare(request)
         client = Client(ws)
         await ws.send_str(json.dumps({"t": "hello", "proto": PROTO, "version": __version__,
-                                      "modes": ["off", "adsb", "air"],
+                                      # 页面靠它认出旧的守护进程：没有 vdl2 就是还没重启过
+                                      "modes": ["off", "adsb", "air", "vdl2"],
                                       # 频谱帧的量化常数由这里告诉页面，页面不另抄一份
                                       "spectrum": {"db_min": DB_MIN, "db_step": DB_STEP}}))
-        for kind in ("status", "outline", "aircraft", "channels", "candidates", "recordings", "iqs"):   # 连上就给全量，不用等下一拍
+        for kind in ("status", "outline", "aircraft", "channels", "candidates", "recordings", "iqs", "vdl2"):   # 连上就给全量，不用等下一拍
             client.offer(kind, self.engine.snapshot(kind))
         self.clients.add(client)
         self._count_listeners()

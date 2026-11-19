@@ -381,6 +381,7 @@ var bound = {};
 var hooks = { styleReady:[],        // 样式重建后要重挂的图层
               clickLayers:[],       // 点在这些图层上不算「点了空白」
               flightDetail:null,    // function(kv, hex)：往航班详情里追加几行
+              flightExtra:null,     // function(body, hex)：航班详情建好之后，往面板末尾追加一组内容
               units:null,           // function()：公制 / 英制切换了，扩展里带单位的地方该重画
               freqRow:null,         // function(tr, fq, i, ap)：频率表每建好一行调一次；ap = {id, label, list}
               detail:null,          // function(id | null)：详情面板换成了哪个机场，或不再显示机场
@@ -1509,6 +1510,9 @@ var AC_TRAIL_GAP_S = 3;          // 历史点至少隔这么久记一个。本�
                                  // 解码的量化抖动，逐点连起来是锯齿；抽稀后再用样条连才顺
 var AC_TRAIL_BREAK_S = 45;       // 两个点隔了这么久（丢了一阵信号）就另起一段，不硬连
 var acVis = {};                  // 来源 -> 是否要求显示；任何一个来源要显示，图层就得开着
+// 扩展脚本给飞机打的标记：名字 -> { ICAO24: 1 }。单独存一张表而不是写在飞机的记录上：
+// 记录会随着来源的快照删了又建，标记是另一条数据流（比如「这架飞机发过数据链报文」）说了算的。
+var acTags = {};
 var trailsOn = true;             // 侧栏「显示尾迹」。只管画不画，历史点照常攒着，重新打开立刻就有
 
 function acIngest(src, list){
@@ -1562,7 +1566,9 @@ function acShow(src, on){
 function trailVis(){ return acVisible() && trailsOn ? "visible" : "none"; }
 function acApplyVis(){
   if (!map) return;
-  if (map.getLayer("flights")) map.setLayoutProperty("flights", "visibility", acVisible() ? "visible" : "none");
+  ["flights", "flights-dl"].forEach(function(l){
+    if (map.getLayer(l)) map.setLayoutProperty(l, "visibility", acVisible() ? "visible" : "none");
+  });
   ["flight-trails", "flight-trails-local"].forEach(function(l){
     if (map.getLayer(l)) map.setLayoutProperty(l, "visibility", trailVis());
   });
@@ -1632,7 +1638,8 @@ function acBest(r){
 
 function acProps(r, b){
   return { hex:r.hex, cs:r.cs, reg:r.reg, ty:r.ty,
-           alt:b.k.alt, gs:b.k.gs, tr:b.k.tr || 0, src:b.src };
+           alt:b.k.alt, gs:b.k.gs, tr:b.k.tr || 0, src:b.src,
+           dl:acTags.dl && acTags.dl[r.hex] ? 1 : 0 };
 }
 
 function acCollection(){
@@ -1710,6 +1717,13 @@ function addFlightLayer(){
                                1,"rgba(" + d[2] + "," + d[3] + ")"] } });
   });
   map.addSource("flights", { type:"geojson", data:acCollection() });
+  // 本地接收机收到过它的数据链报文的飞机：图标外面套一个圈。垫在图标下面，不挡高度的颜色
+  map.addLayer({
+    id:"flights-dl", type:"circle", source:"flights", filter:["==",["get","dl"],1],
+    layout:{ "visibility": acVisible() ? "visible" : "none" },
+    paint:{ "circle-radius":["interpolate",["linear"],["zoom"], 3,7, 7,11, 11,15],
+            "circle-color":"rgba(8,145,178,.14)", "circle-stroke-color":"#0891b2", "circle-stroke-width":1.6 }
+  });
   map.addLayer({
     id:"flights", type:"symbol", source:"flights",
     layout:{ "visibility": acVisible() ? "visible" : "none",
@@ -2032,6 +2046,7 @@ function showFlightDetail(p){
   var status = el("div","hint","查询中…");
   rbox.append(status);
   body.append(rbox);
+  if (hooks.flightExtra) hooks.flightExtra(body, p.hex);
   box.classList.add("on");
 
   if (!p.cs){ status.textContent = "该机没有广播呼号，无法查询航线。"; return; }
@@ -2128,6 +2143,10 @@ window.__probe = function(){
            flights:{ supported:flightsSupported(), on:flightsOn, fails:flightFails,
                      layer:!!map.getLayer("flights"),
                      n:acCount(), net:acCount("net"), local:acCount("local"),
+                     // 带数据链标记的飞机：从真正交给地图的要素里数，不是从扩展脚本自己的表里
+                     tagged:acCollection().features.filter(function(f){ return f.properties.dl; })
+                              .map(function(f){ return f.properties.hex; }),
+                     dlLayer:!!map.getLayer("flights-dl"),
                      trails:acTrails().features.length,
                      // 状态表里有不等于画出来了：shown 是当前视口内真正渲染出的图标数
                      shown:map.getLayer("flights") ? map.queryRenderedFeatures({layers:["flights"]}).length : -1 },
@@ -2222,7 +2241,16 @@ window.__app = { map:function(){ return map; }, el:el, fmt:fmt,
                              return { id:id, code:icaoOf(r, DT[id] || {}) || r[IDENT], name:r[NAME],
                                       lat:r[LAT], lon:r[LON] }; } },
                  ac:{ ingest:acIngest, render:acRender, show:acShow, count:acCount,
-                      get:function(hex){ return AC[hex] || null; } } };
+                      get:function(hex){ return AC[hex] || null; },
+                      // 给一批飞机打标记（set 是 { hex:1 }）。立刻重画，不等下一次取数
+                      tag:function(name, set){ acTags[name] = set || {}; acRender(true); },
+                      // 按地址打开一架飞机的详情；不在图上就返回 false
+                      open:function(hex){
+                        var r = AC[hex], b = r ? acBest(r) : null;
+                        if (!b) return false;
+                        showFlightDetail(acProps(r, b));
+                        if (!map.getBounds().contains([b.k.lon, b.k.lat])) map.easeTo({ center:[b.k.lon, b.k.lat] });
+                        return true; } } };
 
 function boot(){
   // pmtiles 协议：让 MapLibre 能从单个大文件按 Range 读瓦片

@@ -193,11 +193,51 @@ class Station:
                    depth=float(depth) / 100 if depth else 0.6)
 
 
+class Vdl2Model:
+    """一段真的 VDL2 波形，每隔 period_s 秒在 hz 上发一遍。
+
+    D8PSK 调制、RS 纠错、交织、扰码，自己合成一套的工作量和出错的机会都不小。
+    dumpvdl2 的源码里带着一段模型信号（test/vdl2_model_16b_1050kHz.wav：1.05 MS/s、
+    16 位 I/Q，里面是地面站发给一架飞机的两帧），编译脚本把它留在了 .vdl2/share/ 下。
+    这里把它升到 2.4 MS/s 摆进窗口，真的解码器就有东西可解——不插接收机也能把
+    「重采样 → 管道 → dumpvdl2 → 报文」整条链跑一遍。
+    """
+    def __init__(self, path, hz=136_975_000, period_s=2.0, amp=20.0):
+        with open(path, "rb") as f:
+            raw = np.frombuffer(f.read()[44:], "<i2").astype(np.float32)     # 44 字节的 WAV 头之后就是样本
+        x = raw[0::2] + 1j * raw[1::2]
+        x = x[:len(x) - len(x) % 7]
+        # 1.05 → 2.4 MS/s 是 ×16/7。只在加载时做一次，整段过 FFT 最省事
+        n, m = len(x), len(x) * 16 // 7
+        spec = np.zeros(m, np.complex128)
+        spec[(m - n) // 2:(m - n) // 2 + n] = np.fft.fftshift(np.fft.fft(x))
+        y = np.fft.ifft(np.fft.ifftshift(spec))
+        self.wave = (y / np.abs(y).max() * amp).astype(np.complex64)
+        self.hz, self.period = float(hz), max(int(period_s * RATE), len(self.wave))
+
+    def add(self, buf, pos, center_hz):
+        """把落在 [pos, pos + len(buf)) 这一段里的波形叠到 buf 上。"""
+        off = self.hz - center_hz
+        if abs(off) > RATE / 2 - 20_000:
+            return
+        at = pos % self.period               # 这一块的开头在一个周期里的位置
+        if at < len(self.wave):
+            k = min(len(buf), len(self.wave) - at)
+            n = np.arange(pos, pos + k, dtype=np.float64)
+            buf[:k] += self.wave[at:at + k] * np.exp(2j * np.pi * (off / RATE) * n)
+        wrap = self.period - at              # 这一块里下一个周期从哪儿开始
+        if wrap < len(buf):
+            k = min(len(buf) - wrap, len(self.wave))
+            n = np.arange(pos + wrap, pos + wrap + k, dtype=np.float64)
+            buf[wrap:wrap + k] += self.wave[:k] * np.exp(2j * np.pi * (off / RATE) * n)
+
+
 class AirBand:
     """把若干个 Station 铺成 cu8 采样块。只画落在当前窗口里的台。"""
 
-    def __init__(self, stations, seed=2, noise=1.5):
+    def __init__(self, stations, seed=2, noise=1.5, bursts=()):
         self.stations = list(stations)
+        self.bursts = list(bursts)           # Vdl2Model
         self.rng = np.random.default_rng(seed)
         self.noise = noise
         self.pos = 0
@@ -214,6 +254,8 @@ class AirBand:
             keyed = (t % period) < s.on_s if s.off_s > 0 else 1.0
             env = s.amp * (1 + s.depth * np.cos(2 * np.pi * s.tone_hz * t)) * keyed
             buf += env * np.exp(2j * np.pi * (off / RATE) * n)
+        for b in self.bursts:
+            b.add(buf, self.pos, center_hz)
         self.pos += nsamples
         iq = np.empty(2 * nsamples, np.float32)
         iq[0::2], iq[1::2] = buf.real, buf.imag

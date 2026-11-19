@@ -225,9 +225,11 @@ function buildMenu() {
     tpl.push({ label: "接收机", submenu: [
       { label: "接收 ADS-B", accelerator: "CmdOrCtrl+1", click: () => toPage("mode", "adsb") },
       { label: "回到话音监听", accelerator: "CmdOrCtrl+2", click: () => toPage("mode", "air") },
+      { label: "接收 VDL2 数据链", accelerator: "CmdOrCtrl+3", click: () => toPage("mode", "vdl2") },
       { label: "关闭并释放设备", accelerator: "CmdOrCtrl+.", click: () => toPage("mode", "off") },
       { type: "separator" },
-      { label: "频谱与瀑布图", accelerator: "CmdOrCtrl+3", click: () => toPage("view") },
+      // 数字键留给模式（与页面里的 1 / 2 / 3 一致），瀑布图让到 4；页面里它是 W
+      { label: "频谱与瀑布图", accelerator: "CmdOrCtrl+4", click: () => toPage("view") },
       { label: "设定接收机位置…", click: () => toPage("pick", true) },
     ] });
   }
