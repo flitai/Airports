@@ -62,7 +62,7 @@
 tr.sdr-cur td{background:rgba(37,99,235,.06)}
 
 /* 底部停靠栏：标题与控件、频谱与瀑布图、频道条。高度由内容决定，写进 --dock-h，
-   详情面板、地图控件、数据来源那行字都跟着让位 */
+   详情面板和地图控件都跟着让位 */
 #sdrDock{position:absolute;left:0;right:0;bottom:0;z-index:5;display:none;
          background:rgba(255,255,255,.97);border-top:1px solid var(--line);
          box-shadow:0 -2px 12px rgba(16,24,40,.08);font-size:12px;outline:none}

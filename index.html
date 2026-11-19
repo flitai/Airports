@@ -85,9 +85,8 @@
        transform:translate(-50%,-165%)}
   #boot{position:absolute;inset:0;z-index:9;background:#eef1f5;display:flex;
         align-items:center;justify-content:center;color:var(--dim);font-size:13px}
-  #note{position:absolute;left:12px;bottom:calc(8px + var(--dock-h,0px));z-index:4;font-size:11px;color:var(--dim);
-        background:rgba(255,255,255,.86);padding:3px 8px;border-radius:5px}
-  #note a{color:var(--dim)}
+  /* 数据与底图的出处。原先压在地图左下角，挡地图；现在放在侧栏「底图」那一组里 */
+  #credit a{color:var(--dim)}
   #baseAttrib a{color:var(--dim)}
 
   /* ---------- 右侧详情 ---------- */
@@ -171,6 +170,8 @@
       <label class="row" style="margin-top:7px"><input type="checkbox" id="fBldg3d">
         <span class="n">3D 建筑</span><span class="c" id="bldgNote"></span></label>
       <div class="hint" id="baseHint"></div>
+      <div class="hint" id="credit">数据 <a href="https://ourairports.com/" target="_blank" rel="noopener">OurAirports</a>
+        · 底图 <span id="baseAttrib"></span></div>
     </div>
     <div class="grp"><label class="t">实时航班</label>
       <label class="row"><input type="checkbox" id="fFlights">
@@ -201,8 +202,6 @@
     <div id="results"></div>
   </div>
   <div id="tip"></div>
-  <div id="note">数据 <a href="https://ourairports.com/" target="_blank" rel="noopener">OurAirports</a>
-    · 底图 <span id="baseAttrib"></span></div>
 
   <div id="sdrMount"></div>
   <section id="detail">
