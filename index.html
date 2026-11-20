@@ -178,6 +178,8 @@
         <span class="n">显示空中航班</span><span class="c" id="flightCount"></span></label>
       <label class="row" style="margin-top:7px"><input type="checkbox" id="fTrails" checked>
         <span class="n">显示尾迹</span></label>
+      <label class="row" style="margin-top:7px" title="点开一架航班时，在地图上画出起点 → 飞机 → 终点的大圆航线。关掉后详情里照样列出起降机场"><input type="checkbox" id="fRoute" checked>
+        <span class="n">显示航线</span></label>
       <div id="altLegend" title="飞机的填色表示气压高度">
         <div class="bar"></div>
         <div class="tk"><span></span><span></span><span></span><span></span></div>
@@ -1840,12 +1842,15 @@ function setFlights(on){
 }
 
 function initFlightsUI(){
-  var cb = document.getElementById("fFlights"), tr = document.getElementById("fTrails");
+  var cb = document.getElementById("fFlights"), tr = document.getElementById("fTrails"),
+      rt = document.getElementById("fRoute");
   try { if (localStorage.getItem("ap.trails") === "0") trailsOn = false; } catch (e) {}
+  try { if (localStorage.getItem("ap.route") === "0") setRouteLine(false); } catch (e) {}
   tr.checked = trailsOn;
   tr.addEventListener("change", function(){ setTrails(tr.checked); });
+  rt.addEventListener("change", function(){ setRouteLine(rt.checked); });
   if (!flightsSupported()){
-    cb.disabled = tr.disabled = true;
+    cb.disabled = tr.disabled = rt.disabled = true;
     flightHint("file:// 模式不可用：数据源不发 CORS 头，必须经 serve.py 代理。" +
                "请改用 start.command / start.bat 启动。");
     return;
@@ -1950,21 +1955,34 @@ function addRouteLayer(){
   // 虚线样式不能按要素取值，所以分两个图层。
   map.addLayer({ id:"route-flown", type:"line", source:"route",
     filter:["==",["get","k"],"flown"],
-    layout:{ "line-cap":"round", "line-join":"round" },
+    layout:{ "line-cap":"round", "line-join":"round", visibility:routeVis() },
     paint:{ "line-color":"#4ea3ff", "line-width":2.4, "line-opacity":.9 } }, before);
   map.addLayer({ id:"route-line", type:"line", source:"route",
     filter:["==",["get","k"],"togo"],
-    layout:{ "line-cap":"round", "line-join":"round" },
+    layout:{ "line-cap":"round", "line-join":"round", visibility:routeVis() },
     paint:{ "line-color":"#4ea3ff", "line-width":2.2, "line-opacity":.9,
             "line-dasharray":[2,1.6] } }, before);
   map.addLayer({ id:"route-pt", type:"circle", source:"route",
-    filter:["==","$type","Point"],
+    filter:["==","$type","Point"], layout:{ visibility:routeVis() },
     paint:{ "circle-radius":5, "circle-color":"#4ea3ff",
             "circle-stroke-width":2, "circle-stroke-color":"rgba(8,12,18,.85)" } }, before);
   paintRoute();                                 // 切底图重挂图层时，正显示着的航线接着画
 }
 
 var routeCtx = null;                            // 正显示着的航线：{ from, to, hex }
+var routeOn = true;                             // 侧栏「显示航线」。只管画不画：航线照常查、照常算，
+                                                // 详情里的起降机场和距离不受影响，重新打开立刻就有
+var ROUTE_LAYERS = ["route-flown", "route-line", "route-pt"];
+
+function routeVis(){ return routeOn ? "visible" : "none"; }
+function setRouteLine(on){
+  routeOn = !!on;
+  document.getElementById("fRoute").checked = routeOn;
+  try { localStorage.setItem("ap.route", routeOn ? "1" : "0"); } catch (e) {}   // 记不住也无妨
+  if (map) ROUTE_LAYERS.forEach(function(l){
+    if (map.getLayer(l)) map.setLayoutProperty(l, "visibility", routeVis());
+  });
+}
 
 function clearRoute(){
   routeSeq++;                                   // 作废在途的航线请求
@@ -2150,7 +2168,8 @@ window.__probe = function(){
                      trails:acTrails().features.length,
                      // 状态表里有不等于画出来了：shown 是当前视口内真正渲染出的图标数
                      shown:map.getLayer("flights") ? map.queryRenderedFeatures({layers:["flights"]}).length : -1 },
-           route:{ layer:!!map.getLayer("route-line"), n:routeN,
+           route:{ layer:!!map.getLayer("route-line"), n:routeN, on:routeOn,
+                   vis:map.getLayer("route-line") ? map.getLayoutProperty("route-line","visibility") : null,
                    // 航线两段各自的首尾，验收用来确认折点在飞机上
                    legs:(function(){
                      var s = map.getSource("route"), d = s && s.serialize().data, out = {};
@@ -2202,6 +2221,7 @@ window.__probe = function(){
 window.__act = { base:function(m){ document.getElementById("fBase").value=m; setBasemap(m); },
                  flights:function(on){ setFlights(!!on); },
                  trails:function(on){ setTrails(on); },
+                 routeLine:function(on){ setRouteLine(on); },
                  units:function(which){ setUnits(which); },
                  callsigns:function(){
                    var out=[]; for (var h in AC) if (AC[h].cs) out.push(AC[h].cs);

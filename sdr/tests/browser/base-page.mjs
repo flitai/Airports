@@ -89,6 +89,18 @@ if (scenario === "server") {
           same(L.flown[1], here) && same(L.togo[0], here) && L.flown[2] > 10 && L.togo[2] > 10,
           { flownEnd: L.flown && L.flown[1], togoStart: L.togo && L.togo[0], here });
   }
+  // 航线开关：只管地图上画不画，详情里的航线文字和已算好的航线都留着
+  check("航线默认画出", p.route.on === true && p.route.vis === "visible", p.route);
+  const nRoute = p.route.n;
+  await ev("__act.routeLine(false)"); p = await probe();
+  check("关掉「显示航线」只隐藏地图上的航线", p.route.vis === "none" &&
+        await ev('__app.map().getLayoutProperty("route-flown","visibility")') === "none" &&
+        await ev('__app.map().getLayoutProperty("route-pt","visibility")') === "none" &&
+        await ev('document.getElementById("fRoute").checked') === false &&
+        p.route.n === nRoute && p.detailOpen &&
+        (await ev('document.querySelector("#dbody .cgrp").textContent.slice(0,80)')) === routeTxt, p.route);
+  await ev("__act.routeLine(true)"); p = await probe();
+  check("重新打开航线", p.route.vis === "visible" && p.route.n === nRoute, p.route);
 
   // 多来源合并：本地给同一架一个更新的位置，但不带注册号和机型
   const n0 = p.flights.n, tNow = Date.now() / 1000;
