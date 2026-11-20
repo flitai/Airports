@@ -157,13 +157,40 @@ class ReadsbDecoder:
         return data
 
 
+def extras(aircraft):
+    """readsb 还解出了些什么 → 给航班详情看的那几样。没收到的不带，所以多数时候是个很小的字典。
+
+    sq 应答机编码，em 紧急状态（没有紧急情况时不带），vr 升降率 ft/min，sel 选定高度 ft，
+    ias 指示空速 kt，mach 马赫数，wd / ws 飞机算出的风向和风速，oat 外界温度 ℃，
+    cat 飞机类别（A1–C3），gnd 在地面。
+    位置精度（NIC、NACp、SIL 这些）和报文计数不带：那是调试接收机用的，不是给看图的人的。
+    """
+    a, x = aircraft, {}
+    for src, key in (("squawk", "sq"), ("ias", "ias"), ("mach", "mach"), ("wd", "wd"), ("ws", "ws"),
+                     ("oat", "oat"), ("category", "cat")):
+        if a.get(src) is not None:
+            x[key] = a[src]
+    if a.get("emergency") not in (None, "none"):
+        x["em"] = a["emergency"]
+    rate = a.get("baro_rate", a.get("geom_rate"))            # 气压升降率优先，没有就用几何的
+    if rate is not None:
+        x["vr"] = rate
+    sel = a.get("nav_altitude_mcp", a.get("nav_altitude_fms"))   # 面板上拨的优先，其次是飞行管理计算机里的
+    if sel is not None:
+        x["sel"] = sel
+    if a.get("alt_baro") == "ground":
+        x["gnd"] = True
+    return x
+
+
 def slim(aircraft, wall):
     """readsb 的一架飞机 → 发给页面的定长数组。
 
-    [hex, 呼号, lat, lon, 气压高度, 地速, 航向, 位置时刻, 信号强度 dBFS, 距上次收到任何报文的秒数]
+    [hex, 呼号, lat, lon, 气压高度, 地速, 航向, 位置时刻, 信号强度 dBFS, 距上次收到任何报文的秒数, 附加信息]
 
     位置时刻用「本机墙上时间 − seen_pos」换算成绝对时间，页面拿它和联网数据的
     位置时刻比新旧。没解出位置的飞机 lat/lon 为 null，照样发：它算在架数里。
+    附加信息是 extras() 给的字典，排在最后：不认识它的旧页面照样能用前十项。
     """
     alt = aircraft.get("alt_baro")
     has_pos = "lat" in aircraft and "lon" in aircraft
@@ -173,4 +200,4 @@ def slim(aircraft, wall):
             None if alt in ("ground", None) else alt,
             aircraft.get("gs"), aircraft.get("track"),
             round(wall - aircraft.get("seen_pos", 0), 1) if has_pos else None,
-            aircraft.get("rssi"), aircraft.get("seen")]
+            aircraft.get("rssi"), aircraft.get("seen"), extras(aircraft)]

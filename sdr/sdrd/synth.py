@@ -63,22 +63,24 @@ def position_frame(icao, lat, lon, alt_ft, odd):
     return _frame(icao, me)
 
 
-def ident_frame(icao, callsign):
-    me = 4 << 51                                             # TC=4 身份，类别留空
+def ident_frame(icao, callsign, category=0):
+    me = (4 << 51) | ((category & 7) << 48)                  # TC=4 身份；类别 0 是「没说」，3 是 A3 大型机
     for i, ch in enumerate(callsign.upper().ljust(8)[:8]):
         code = _CHARSET.find(ch)
         me |= (code if code > 0 else 32) << (42 - 6 * i)     # 字符集里没有的一律当空格
     return _frame(icao, me)
 
 
-def velocity_frame(icao, gs_kt, track_deg):
-    """TC=19 子类 1：对地速度，按东西 / 南北两个分量给出。"""
+def velocity_frame(icao, gs_kt, track_deg, vr_fpm=0):
+    """TC=19 子类 1：对地速度，按东西 / 南北两个分量给出；vr_fpm 是气压升降率，64 ft/min 一级。"""
     ew = gs_kt * math.sin(math.radians(track_deg))
     ns = gs_kt * math.cos(math.radians(track_deg))
     me = (19 << 51) | (1 << 48)
     me |= (int(ew < 0) << 42) | ((min(1022, round(abs(ew))) + 1) << 32)
     me |= (int(ns < 0) << 31) | ((min(1022, round(abs(ns))) + 1) << 21)
-    me |= 1 << 10                                            # 垂直速率 = 0
+    if vr_fpm:
+        me |= (1 << 20) | (int(vr_fpm < 0) << 19)            # 来源是气压高度；符号位 1 = 下降
+    me |= (min(510, round(abs(vr_fpm) / 64)) + 1) << 10      # 垂直速率，编码值 1 即 0
     return _frame(icao, me)
 
 
@@ -107,7 +109,9 @@ class Traffic:
         self.center = center
         self.craft = [{"icao": 0xABC001 + i, "cs": "SYN%03d" % (i + 1),
                        "radius_nm": 12 + 9 * i, "gs": 220 + 60 * i,
-                       "alt": 6000 + 8000 * i, "phase": 2.1 * i} for i in range(count)]
+                       "alt": 6000 + 8000 * i, "phase": 2.1 * i,
+                       # 第一架在爬升、第三架在下降、中间那架平飞；类别依次是 A3 大型、A5 重型、A1 轻型
+                       "vr": (640, 0, -1280)[i % 3], "cat": (3, 5, 1)[i % 3]} for i in range(count)]
 
     def state(self, craft, t):
         """t 秒时这架飞机的 (lat, lon, alt, gs, track)。"""
@@ -131,9 +135,9 @@ class Traffic:
                 t = base + 0.5 * k
                 lat, lon, alt, gs, track = self.state(c, t)
                 out.append((t, position_frame(c["icao"], lat, lon, alt, k % 2)))
-                out.append((t + 0.004, velocity_frame(c["icao"], gs, track)))
+                out.append((t + 0.004, velocity_frame(c["icao"], gs, track, c["vr"])))
                 if k % 4 == 0:
-                    out.append((t + 0.008, ident_frame(c["icao"], c["cs"])))
+                    out.append((t + 0.008, ident_frame(c["icao"], c["cs"], c["cat"])))
                 k += 1
         return out
 

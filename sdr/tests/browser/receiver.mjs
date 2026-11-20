@@ -39,6 +39,9 @@ await until("callsign", async()=> (await ev("__act.callsigns()")).includes("SYN0
 const cs = await ev('__act.clickFlight("SYN001")');
 const dl0 = await ev('[].map.call(document.querySelectorAll("#dbody dt"),function(d){return d.textContent+"="+d.nextElementSibling.textContent}).join(" | ")');
 check("航班详情标明本地接收和信号强度", cs==="SYN001" && /数据来源=本地接收 · 信号 -?[\d.]+ dBFS/.test(dl0), dl0);
+// 合成的第一架在以 640 ft/min 爬升，类别 A3；它没发应答机编码这些，所以那几行不该出现
+check("详情里有报文带的升降率和类别", /升降率=↑ 3\.3 m\/s/.test(dl0) && /类别=大型（34–136 吨）/.test(dl0), dl0);
+check("没收到的项目不占行", !/应答机编码|选定高度|高空风|外界温度|指示空速|状态=/.test(dl0));
 
 // 接收机位置
 check("设定前没有距离圈数据", p.sdr.home===null && p.sdr.layers.home===true);
@@ -58,6 +61,7 @@ await ev('__act.units("imperial")');
 const dl2 = await ev('[].map.call(document.querySelectorAll("#dbody dt"),function(d){return d.textContent+"="+d.nextElementSibling.textContent}).join(" | ")');
 p = await probe();
 check("切到英制：距离圈、最远收到、距接收机都换成海里", await rings() === "50 nm,100 nm,150 nm,200 nm" && /最远收到 \d+ nm/.test(p.sdr.hint) && /距接收机=1[0-4] nm/.test(dl2), {rings:await rings(), hint:p.sdr.hint});
+check("升降率也跟着换成英尺每分", /升降率=↑ 640 ft\/min/.test(dl2), dl2);
 await ev('__act.units("metric")');
 check("切回公制", await rings() === "100 km,200 km,300 km,400 km");
 

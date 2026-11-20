@@ -45,12 +45,27 @@ class Slim(unittest.TestCase):
     def test_positioned(self):
         row = adsb.slim({"hex": "abc", "flight": "CCA1  ", "lat": 1.234567, "lon": 2.0, "alt_baro": 9000,
                          "gs": 300, "track": 90, "seen": 0.5, "seen_pos": 2.0, "rssi": -20.1}, 1000.0)
-        self.assertEqual(row, ["abc", "CCA1", 1.23457, 2.0, 9000, 300, 90, 998.0, -20.1, 0.5])
+        self.assertEqual(row, ["abc", "CCA1", 1.23457, 2.0, 9000, 300, 90, 998.0, -20.1, 0.5, {}])
 
     def test_no_position_and_on_ground(self):
         row = adsb.slim({"hex": "abc", "alt_baro": "ground", "seen": 1}, 1000.0)
         self.assertEqual(row[2:5], [None, None, None])
         self.assertIsNone(row[7])
+        self.assertEqual(row[10], {"gnd": True})
+
+    def test_extras_for_the_detail_panel(self):
+        full = {"hex": "abc", "alt_baro": 36000, "squawk": "7700", "emergency": "general", "baro_rate": -1216,
+                "geom_rate": -1200, "nav_altitude_mcp": 30016, "nav_altitude_fms": 28000, "ias": 271, "mach": 0.784,
+                "wd": 262, "ws": 71, "oat": -52, "tat": -24, "category": "A5",
+                # 下面这些收到了也不带：调试接收机用的
+                "nic": 8, "nac_p": 10, "sil": 3, "messages": 4321, "nav_qnh": 1013.2, "tas": 450}
+        self.assertEqual(adsb.slim(full, 1000.0)[10],
+                         {"sq": "7700", "em": "general", "vr": -1216, "sel": 30016, "ias": 271, "mach": 0.784,
+                          "wd": 262, "ws": 71, "oat": -52, "cat": "A5"})
+        # 没有紧急情况时不带这一项；气压的没有就退回几何升降率、飞行管理计算机里的高度
+        part = adsb.extras({"emergency": "none", "geom_rate": 64, "nav_altitude_fms": 9000, "squawk": "2000"})
+        self.assertEqual(part, {"sq": "2000", "vr": 64, "sel": 9000})
+        self.assertEqual(adsb.extras({"baro_rate": 0}), {"vr": 0})       # 0 是「平飞」，不是「没收到」
 
 
 class FakeDecoder(unittest.TestCase):

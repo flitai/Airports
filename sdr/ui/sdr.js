@@ -103,8 +103,10 @@ function onAircraft(list){
     var a = list[i];
     // a = [hex, 呼号, lat, lon, 高度, 地速, 航向, 位置时刻, 信号强度, 距上次报文秒数]
     if (a[2] == null || now - a[7] > FRESH_S) continue;
-    out.push({ hex:a[0], cs:a[1], lat:a[2], lon:a[3], alt:a[4], gs:a[5], tr:a[6] || 0,
-               t:a[7], x:{ rssi:a[8], seen:a[9] } });
+    // a[10] 是解码器另外解出的几样（应答机编码、升降率……），只在航班详情里用。旧的守护进程不给这一项
+    var x = { rssi:a[8], seen:a[9] }, more = a[10];
+    if (more) for (var k in more) x[k] = more[k];
+    out.push({ hex:a[0], cs:a[1], lat:a[2], lon:a[3], alt:a[4], gs:a[5], tr:a[6] || 0, t:a[7], x:x });
   }
   lastLocal = out.length;
   app.ac.ingest("local", out);
@@ -1359,12 +1361,42 @@ function setPicking(on){
 }
 
 // ---------- 航班详情里的本地信息 ----------
+// 自己天线收到的飞机，除了位置、高度、速度，报文里还带着别的：应答机编码、升降率、
+// 机组在面板上拨的目标高度、飞机自己算出的风和温度。联网数据不给这些，所以只有本地
+// 收到的飞机才有这几行；哪一项没收到，那一行就不出现。
+var SQUAWKS = { "7500":"非法干扰（劫持）", "7600":"无线电失效", "7700":"紧急情况" };
+var EMERG = { general:"一般紧急情况", lifeguard:"医疗救护", minfuel:"最低油量", nordo:"无线电失效",
+              unlawful:"非法干扰", downed:"迫降", reserved:"保留值" };
+var CATS = { A1:"轻型（7 吨以下）", A2:"小型（7–34 吨）", A3:"大型（34–136 吨）", A4:"大型 · 强尾流（如波音 757）",
+             A5:"重型（136 吨以上）", A6:"高性能（高过载、高速）", A7:"旋翼机",
+             B1:"滑翔机", B2:"气球、飞艇", B3:"跳伞", B4:"超轻型、滑翔伞", B6:"无人机", B7:"航天器",
+             C1:"地面应急车辆", C2:"地面服务车辆", C3:"固定障碍物" };
+
+function climbText(fpm){           // 升降率。小于一级（64 ft/min）的抖动算平飞
+  if (Math.abs(fpm) < 64) return "平飞";
+  var v = Math.abs(fpm);
+  return (fpm > 0 ? "↑ " : "↓ ") + (app.units.metric() ? (v * 0.00508).toFixed(1) + " m/s" : fmt(Math.round(v)) + " ft/min");
+}
+
 function flightDetail(kv, hex){
   var r = app.ac.get(hex), b = r && r.by.local;
   if (!b){ if (st && st.mode === "adsb") kv("数据来源", "联网数据（本地未收到）"); return; }
-  kv("数据来源", "本地接收" + (b.x && b.x.rssi != null ? " · 信号 " + b.x.rssi + " dBFS" : ""));
+  var x = b.x || {};
+  kv("数据来源", "本地接收" + (x.rssi != null ? " · 信号 " + x.rssi + " dBFS" : ""));
   if (st && st.home)
     kv("距接收机", app.units.dist(app.nmBetween([st.home[1], st.home[0]], [b.lon, b.lat])));
+  if (x.gnd) kv("状态", "在地面");
+  if (x.sq) kv("应答机编码", x.sq + (SQUAWKS[x.sq] ? " · " + SQUAWKS[x.sq] : ""));
+  if (x.em) kv("紧急状态", EMERG[x.em] || x.em);
+  if (x.vr != null && !x.gnd) kv("升降率", climbText(x.vr));
+  if (x.sel != null) kv("选定高度", app.units.alt(x.sel));
+  if (x.ias != null || x.mach != null)
+    kv(x.ias != null ? "指示空速" : "马赫数",
+       [x.ias != null ? app.units.speed(x.ias) : "", x.mach != null ? (x.ias != null ? "马赫 " : "") + (+x.mach).toFixed(2) : ""]
+         .filter(Boolean).join(" · "));
+  if (x.wd != null && x.ws != null) kv("高空风", Math.round(x.wd) + "° · " + app.units.speed(x.ws));
+  if (x.oat != null) kv("外界温度", String(Math.round(x.oat)).replace("-", "−") + " ℃");
+  if (CATS[x.cat]) kv("类别", CATS[x.cat]);          // A0、B0 这类是「没说」，不显示
 }
 
 // ---------- 启动 ----------
